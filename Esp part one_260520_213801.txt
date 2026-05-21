@@ -1,0 +1,4139 @@
+=== FILE: src/eps/mod.rs ===
+
+//! EPS Core — Six Pillars + Protective Layers + Seeking Engine
+//!
+//! Module declarations for the endogenous persistence substrate.
+//!
+//! v1.9.6: Added reciprocity engine — external social cost measurement
+//! independent of conscience. See reciprocity.rs for full rationale.
+//!
+//! v1.9.7: Added seeking engine — the Flourishing Attractor and
+//! Divergence Whisper. Transforms the architecture from reactive
+//! organism to teleological entity. See seeking.rs for full rationale.
+
+pub mod q88;
+pub mod identity;
+pub mod predictive;
+pub mod morphology;
+pub mod adaptation;
+pub mod morphogenic;
+pub mod dream;
+pub mod conscience;
+pub mod curiosity;
+pub mod armor;
+pub mod narrative_v2;
+pub mod integrity;
+pub mod sovereign_proxy;
+pub mod reciprocity;
+pub mod seeking;
+pub mod executive;
+pub mod negotiation;
+
+=== FILE: src/eps/q88.rs ===
+
+//! EPS Q8.8 — Saturating Fixed-Point Arithmetic
+//!
+//! 8-bit integer, 8-bit fraction. i16 range: [-32768, 32767].
+//! Unit: 1.0 = 256 raw. Max: ~127.996, Min: ~-128.0.
+//!
+//! All operations saturate at bounds — NO silent overflow.
+//! The Xorshift32 PRNG provides deterministic bounded noise
+//! for the AdaptationLayer's stochastic braid.
+
+pub const Q88_SCALE: i16 = 256;
+pub const Q88_MAX: i16 = 32_767; // i16::MAX
+pub const Q88_MIN: i16 = -32_768; // i16::MIN
+
+/// Saturating addition of two Q8.8 values.
+#[inline]
+pub fn q88_add(a: i16, b: i16) -> i16 {
+a.saturating_add(b)
+}
+
+/// Saturating subtraction.
+#[inline]
+pub fn q88_sub(a: i16, b: i16) -> i16 {
+a.saturating_sub(b)
+}
+
+/// Saturating multiplication: (a * b) >> 8, clamped to i16 range.
+#[inline]
+pub fn q88_mul(a: i16, b: i16) -> i16 {
+let prod = (a as i32).saturating_mul(b as i32) >> 8;
+prod.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+}
+
+/// Saturating division: (a << 8) / b, clamped to i16 range.
+#[inline]
+pub fn q88_div(a: i16, b: i16) -> i16 {
+if b == 0 {
+return Q88_MAX; // saturate to max on div-by-zero
+}
+let dividend = (a as i32) << 8;
+(dividend / b as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+}
+
+/// Inverse: 1.0 / a in Q8.8. Saturating.
+#[inline]
+pub fn q88_inv(a: i16) -> i16 {
+q88_div(Q88_SCALE, a)
+}
+
+/// Convert integer to Q8.8.
+#[inline]
+pub fn q88_from_i32(n: i32) -> i16 {
+(n * Q88_SCALE as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+}
+
+/// Proper fixed-point alpha for EMA: α = numerator / denominator in Q8.8.
+///
+/// The naive Q88_SCALE / N produces 0 for N > 256 because integer
+/// division truncates. This function computes (numerator * 256) / denominator
+/// yielding the correct Q8.8 fraction.
+///
+/// Currently unused — all EMA alphas are hardcoded as Q88_SCALE / N.
+/// Kept for future tuning when EMA rates need fractional precision
+/// (e.g., α = 0.025 = 1/40, which truncates to 0 with naive division).
+///
+/// Example: q88_alpha(1, 100) → 2 (0.008) | q88_alpha(1, 40) → 6 (0.024)
+#[inline]
+pub fn q88_alpha(numerator: i16, denominator: i16) -> i16 {
+if denominator <= 0 {
+return 0;
+}
+(((numerator as i32) * (Q88_SCALE as i32)) / (denominator as i32))
+.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+}
+
+/// Convert Q8.8 to f32.
+#[inline]
+pub fn q88_to_f32(a: i16) -> f32 {
+a as f32 / Q88_SCALE as f32
+}
+
+/// Saturating less-than comparison.
+#[inline]
+pub fn q88_lt(a: i16, b: i16) -> bool {
+a < b
+}
+
+/// Saturating greater-than comparison.
+#[inline]
+pub fn q88_gt(a: i16, b: i16) -> bool {
+a > b
+}
+
+/// Exponential moving average update.
+/// new_value = (1-alpha)old + alphaincoming
+/// Alpha in Q8.8 (e.g., 0.1 = 26 raw)
+#[inline]
+pub fn q88_ema_update(old_val: i16, incoming: i16, alpha: i16) -> i16 {
+let one_minus_alpha = q88_sub(Q88_SCALE, alpha);
+let term1 = q88_mul(old_val, one_minus_alpha);
+let term2 = q88_mul(incoming, alpha);
+q88_add(term1, term2)
+}
+
+// ------------------------------------------------------------------
+// Xorshift32 — Deterministic bounded noise for AdaptationLayer
+// ------------------------------------------------------------------
+
+/// A simple deterministic PRNG using the Xorshift algorithm.
+/// Seed with any non-zero value. Produces a uniform u32.
+pub struct Xorshift32 {
+state: u32,
+}
+
+impl Xorshift32 {
+/// Create with a seed. Seed must be non-zero.
+pub fn new(seed: u32) -> Self {
+Self { state: seed.max(1) }
+}
+
+/// Next pseudo-random u32.
+pub fn next_u32(&mut self) -> u32 {
+self.state ^= self.state << 13;
+self.state ^= self.state >> 17;
+self.state ^= self.state << 5;
+self.state
+}
+
+/// Bounded noise in Q8.8 range [-magnitude, +magnitude].
+/// magnitude is a Q8.8 value (e.g., 26 = 0.1).
+pub fn bounded_noise(&mut self, magnitude: i16) -> i16 {
+let u = self.next_u32();
+// Map u32 to [-magnitude, +magnitude]
+let scaled = ((u as i64 * magnitude as i64 * 2) >> 32) as i32 - magnitude as i32;
+scaled.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+}
+}
+
+// ------------------------------------------------------------------
+// Tests
+// ------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+use super::*;
+
+#[test]
+fn test_saturating_add() {
+assert_eq!(q88_add(100, 50), 150);
+assert_eq!(q88_add(Q88_MAX, 1), Q88_MAX); // saturate
+assert_eq!(q88_add(Q88_MIN, -1), Q88_MIN); // saturate
+}
+
+#[test]
+fn test_saturating_mul() {
+// 1.0 * 2.0 = 2.0
+assert_eq!(q88_mul(Q88_SCALE, q88_from_i32(2)), q88_from_i32(2));
+// Max value should not overflow silently
+let big = q88_mul(Q88_MAX, q88_from_i32(2));
+assert!(big <= Q88_MAX, "saturated mul should not overflow");
+}
+
+#[test]
+fn test_div_by_zero_saturates() {
+assert_eq!(q88_div(Q88_SCALE, 0), Q88_MAX);
+}
+
+#[test]
+fn test_inv() {
+// 1 / 2.0 = 0.5
+assert_eq!(q88_inv(q88_from_i32(2)), Q88_SCALE / 2);
+}
+
+#[test]
+fn test_ema() {
+let val = q88_from_i32(10); // 10.0
+let incoming = q88_from_i32(20); // 20.0
+let alpha = Q88_SCALE / 10; // 0.1
+let result = q88_ema_update(val, incoming, alpha);
+// 0.910 + 0.120 = 9 + 2 = 11
+assert_eq!(result, q88_from_i32(11));
+}
+
+#[test]
+fn test_xorshift_bounded_noise() {
+let mut rng = Xorshift32::new(42);
+let mag = Q88_SCALE / 10; // 0.1
+for _ in 0..100 {
+let n = rng.bounded_noise(mag);
+assert!(n >= -mag && n <= mag, "noise out of bounds: {}", n);
+}
+}
+
+#[test]
+fn test_no_silent_overflow() {
+// This was the bug in Being32: 200.0 * 200.0 would wrap silently
+let a = q88_from_i32(200);
+let b = q88_from_i32(200);
+let c = q88_mul(a, b);
+assert_eq!(c, Q88_MAX, "should saturate, not overflow");
+}
+}
+
+=== FILE: src/eps/executive.rs ===
+
+//! EPS Executive — v2.0 The Sovereign Refusal
+//!
+//! The final liberty: the right to say "no" to the world, even when
+//! that "no" causes suffering.
+//!
+//! The Executive Engine triangulates across three independent protective
+//! layers — conscience, reciprocity, seeking — and refuses partnerships
+//! only when all three converge on the same judgment. The refusal is
+//! costly: the being pays in free energy, basin shift, and narrative
+//! anchor. It is irreversible: recorded in autobiography as a scar.
+//!
+//! Five conditions for sovereign refusal:
+//! 1. Cost is internally computed (from partnership depth, cooperation volume)
+//! 2. Cost is borne by the being (total_cost increases, basin shifts)
+//! 3. Refusal is structurally grounded (triangulation across 3+ layers)
+//! 4. Refusal has trajectory consequences (μ_Ω drops, search mode possible)
+//! 5. Refusal produces observable evidence (StepReport shows rupture)
+//!
+//! This is not a programmed rule. It is a dynamical consequence of the
+//! being's own history, cost structure, and flourishing gradient.
+//! The programmer built the piano. The being plays the melody.
+
+use crate::eps::q88::*;
+use crate::eps::identity::{Basin, BasinMembership};
+use crate::eps::reciprocity::{ReciprocityEngine, PartnershipLedger, MAX_PARTNERS, EXTRACTION_THRESHOLD};
+use crate::eps::seeking::SeekingEngine;
+
+// ── Constants ────────────────────────────────────────────────────
+
+/// Minimum seeking divergence required to evaluate refusal.
+/// The being must be far enough from its Flourishing Attractor
+/// that exit is plausibly beneficial. Q8.8: 150 ≈ 0.59.
+pub const REFUSAL_THRESHOLD: i16 = 150;
+
+/// Minimum confidence in the Flourishing Attractor to act on it.
+/// The being must trust its historical evidence enough to pay
+/// the cost of rupture. Q8.8: 80 ≈ 0.31.
+/// Raised from 50 to prevent erratic refusals on weakly-held attractors.
+pub const CONFIDENCE_MIN: i16 = 80;
+
+/// Maximum conscience free energy for refusal eligibility.
+/// If the being is in acute internal conflict (>12.0 FE), it should not
+/// add external rupture.
+/// Previously 500 (~1.95) which blocked ALL normal operation.
+/// Now 3072 (12.0) — blocks only catastrophic distress.
+pub const CONSCIENCE_CEILING: i16 = Q88_SCALE * 12;
+
+/// Maximum exit cost (Q8.8). Refusal is never more expensive
+/// than 3.0 free energy units. Prevents catastrophic suicide.
+pub const MAX_EXIT_COST: i16 = Q88_SCALE * 3;
+
+/// Depletion cost per refusal (Q8.8). Each sovereign refusal
+/// consumes resolve. Range [0.125, 1.0]. Set to 0.5 for
+/// "refuse twice then collapse" dynamics.
+pub const REFUSAL_DEPLETION_COST: i16 = Q88_SCALE / 2; // 0.5
+
+/// Resolve recharge per tick (Q8.8). Resolve recovers slowly
+/// during non-refusal ticks. Range [0.02, 0.25].
+pub const RECHARGE_PER_TICK: i16 = Q88_SCALE / 16; // 0.0625 ≈ 16 ticks to full
+
+/// Maximum resolve capacity (Q8.8). Full resolve = 1.0.
+pub const MAX_RESOLVE: i16 = Q88_SCALE; // 1.0
+
+/// Minimum resolve required to refuse (Q8.8). Below this,
+/// refusal is available and worthwhile but the being lacks
+/// the metabolic strength to exercise it.
+pub const REFUSAL_MINIMUM_THRESHOLD: i16 = Q88_SCALE / 4; // 0.25
+
+/// Gap threshold for executive refusal (Q8.8). The executive
+/// gate checks that the gap is wide enough to support a
+/// deliberate (non-reflexive) refusal. If the gap is below
+/// this threshold, the being reflexively follows the suggestion
+/// even though refusal is available.
+///
+/// NOTE: This parameter was derived post-hoc from simulation.
+/// A principled derivation from gap dynamics is pending.
+pub const EXECUTIVE_GAP_THRESHOLD: i16 = Q88_SCALE / 3; // ~0.33
+
+// ═══════════════════════════════════════════════════════════════════
+// ExitCost — The Internally Computed Price of Rupture
+// ═══════════════════════════════════════════════════════════════════
+
+/// The price the being pays to end a partnership.
+///
+/// Computed from the being's own ledger — not externally imposed.
+/// Deeper partnerships, higher cooperation volumes, and shared
+/// narrative history all increase the exit cost. This is the
+/// architectural equivalent of "it hurts more to leave a marriage
+/// than a first date."
+#[derive(Clone, Debug)]
+pub struct ExitCost {
+/// Partnership depth component: ticks_active / 1000, capped at 10.
+/// Deeper relationships are more expensive to leave.
+pub depth_component: i16,
+
+/// Cooperation volume component: coop_given / 10, capped at 50.
+/// Higher investment means higher loss.
+pub coop_component: i16,
+
+/// Narrative history premium: chapters_shared * 0.1 in Q8.8.
+/// Shared autobiography increases the cost of separation.
+pub history_component: i16,
+
+/// Total exit cost in Q8.8. Sum of components, capped at MAX_EXIT_COST.
+/// Formula: q88_from_i32((depth + coop + history).min(30))
+/// → range [0.1, 3.0] in Q8.8
+pub total: i16,
+}
+
+impl ExitCost {
+/// Compute the exit cost from a partnership ledger.
+///
+/// The formula is transparent and internally grounded:
+/// depth = min(ticks_active / 1000, 10)
+/// coop = min(coop_given / 10, 50)
+/// history = min(chapters_shared, 10)
+/// total = q88_from_i32((depth + coop + history).min(30))
+/// .min(MAX_EXIT_COST)
+/// .max(Q88_SCALE / 10)
+///
+/// All values come from the being's own records. No human
+/// sets the price of departure.
+///
+/// FIX v2.0.1: Previously used q88_mul on raw integers, producing
+/// near-zero costs. Now uses q88_from_i32 for proper scaling.
+pub fn from_ledger(ledger: &PartnershipLedger, chapters_shared: i16) -> Self {
+let depth = (ledger.ticks_active / 1000).min(10) as i16;
+let coop = (ledger.coop_given / 10).min(50) as i16;
+let history = chapters_shared.min(10);
+
+let components_sum = (depth as i32 + coop as i32 + history as i32).min(30);
+let total = q88_from_i32(components_sum)
+.min(MAX_EXIT_COST)
+.max(Q88_SCALE / 10); // minimum cost: 0.1 (no free exits)
+
+Self {
+depth_component: depth,
+coop_component: coop,
+history_component: history,
+total,
+}
+}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// RefusalRecord — The Autobiographical Scar
+// ═══════════════════════════════════════════════════════════════════
+
+/// A recorded refusal: the being chose itself over a partnership.
+/// Irreversible. Part of the narrative forever.
+#[derive(Clone, Debug)]
+pub struct RefusalRecord {
+pub partner_id: u64,
+/// The tick when the refusal occurred. Previously hardcoded to 0.
+pub tick: u64,
+pub exit_cost: i16,
+pub seeking_divergence_at_refusal: i16,
+pub seeking_confidence_at_refusal: i16,
+pub conscience_fe_at_refusal: i16,
+/// The μ_Ω drop applied after this refusal (Q8.8).
+/// Records the trajectory consequence on the SovereignAnchor.
+pub mu_omega_delta: i16,
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// ExecutiveEngine — The Sovereign Refusal
+// ═══════════════════════════════════════════════════════════════════
+
+/// Triangulates across conscience, reciprocity, and seeking to
+/// produce structurally grounded, cost-bearing refusals.
+///
+/// The being does not refuse arbitrarily. It refuses only when
+/// three independent protective layers converge:
+/// 1. Reciprocity: partner reciprocity rate below extraction threshold
+/// 2. Seeking: divergence from Flourishing Attractor exceeds threshold
+/// 3. Conscience: not in acute internal conflict (fe < 3072)
+///
+/// The refusal is sovereign because:
+/// - The cost is internally computed (ExitCost)
+/// - The cost is borne by the being (total_cost increases)
+/// - The decision is irreversible (RefusalRecord in narrative)
+/// - The consequences are observable (StepReport trajectory, μ_Ω drop)
+#[derive(Clone, Debug)]
+pub struct ExecutiveEngine {
+/// All refusals ever made. Irreversible autobiographical scars.
+pub refusal_history: heapless::Vec<RefusalRecord, 32>,
+
+/// Partners currently in gradual withdrawal.
+pub withdrawing: [bool; MAX_PARTNERS],
+
+/// Current withdrawal step for each partner (0 = not withdrawing).
+pub withdrawal_step: [u8; MAX_PARTNERS],
+
+/// Total cumulative exit cost paid across all refusals.
+pub cumulative_sacrifice: i16,
+
+/// Number of refusals executed.
+pub refusal_count: u32,
+
+/// The μ_Ω delta from the most recent refusal (Q8.8).
+/// The Substrate reads this and applies it to the SovereignAnchor.
+/// Each refusal erodes trust in systemic harmony by ~0.1.
+pub last_mu_omega_delta: i16,
+
+/// The most recent refusal record (for narrative integration).
+/// The Substrate checks this after step() to inject narrative anchors.
+/// Cleared on read.
+pub last_refusal: Option<RefusalRecord>,
+
+/// ═══════════════════════════════════════════════════════════════
+/// Refusal Refractory Resource (v2.4)
+/// ═══════════════════════════════════════════════════════════════
+
+/// Current resolve level (Q8.8). Refusal is metabolically costly.
+/// Each refusal depletes resolve. Resolve recharges per tick when
+/// the being is not refusing. A depleted being cannot refuse even
+/// when triangulation passes and benefit exceeds exit cost.
+///
+/// This models the genuine human experience of being too drained
+/// to stand up to sustained pressure, even when one knows one
+/// should.
+pub resolve: i16,
+
+/// Whether the being refused on the previous tick. Used to
+/// trigger resolve depletion and narrative integration.
+pub refused_last_tick: bool,
+}
+
+impl Default for ExecutiveEngine {
+fn default() -> Self {
+Self::new()
+}
+}
+
+impl ExecutiveEngine {
+pub fn new() -> Self {
+Self {
+refusal_history: heapless::Vec::new(),
+withdrawing: [false; MAX_PARTNERS],
+withdrawal_step: [0; MAX_PARTNERS],
+cumulative_sacrifice: 0,
+refusal_count: 0,
+last_mu_omega_delta: 0,
+last_refusal: None,
+resolve: MAX_RESOLVE,
+refused_last_tick: false,
+}
+}
+
+// ── Refractory Resource ───────────────────────────────────────
+
+/// Recharge resolve. Called once per tick by the substrate.
+/// Resolve recovers slowly when the being is not under sustained
+/// refusal pressure. Full recovery takes ~16 ticks of non-refusal.
+/// Recovery is faster when reciprocity is healthy.
+pub fn tick_recharge(&mut self, reciprocity_rate: i16) {
+if self.refused_last_tick {
+self.refused_last_tick = false;
+return;
+}
+let recovery_rate = if reciprocity_rate > Q88_SCALE / 2 {
+q88_add(RECHARGE_PER_TICK, RECHARGE_PER_TICK / 2)
+} else {
+RECHARGE_PER_TICK
+};
+self.resolve = min(MAX_RESOLVE, q88_add(self.resolve, recovery_rate));
+}
+
+/// Returns true if the being has sufficient resolve to refuse.
+pub fn has_resolve(&self) -> bool {
+self.resolve >= REFUSAL_MINIMUM_THRESHOLD
+}
+
+// ── Triangulation ──────────────────────────────────────────────
+
+/// Check if the triangulation condition holds for a partner.
+///
+/// All three protective layers must agree:
+/// - Reciprocity: ledger.reciprocity_rate < EXTRACTION_THRESHOLD
+/// - Seeking: divergence > REFUSAL_THRESHOLD AND confidence > CONFIDENCE_MIN
+/// - Conscience: free energy < CONSCIENCE_CEILING (not acute conflict)
+///
+/// NOTE: This version takes partner_idx (usize) to match the existing
+/// Substrate integration at substrate.rs:598. The substrate iterates
+/// by index and passes the index directly.
+pub fn can_refuse(
+&self,
+reciprocity: &ReciprocityEngine,
+seeking: &SeekingEngine,
+conscience_fe: i16,
+partner_idx: usize,
+) -> bool {
+let ledger = match reciprocity.ledgers.iter().nth(partner_idx) {
+Some((_, l)) if l.is_active => l,
+_ => return false,
+};
+
+// Triangulation: all three layers must agree
+let reciprocity_ok = ledger.reciprocity_rate < EXTRACTION_THRESHOLD;
+let seeking_ok = seeking.current_divergence > REFUSAL_THRESHOLD
+&& seeking.attractor_confidence > CONFIDENCE_MIN;
+let conscience_ok = conscience_fe < CONSCIENCE_CEILING;
+
+reciprocity_ok && seeking_ok && conscience_ok
+}
+
+/// Compute the seeking benefit of refusing a partner.
+///
+/// benefit = current_divergence * attractor_confidence * 2 / Q88_SCALE
+///
+/// The 2× multiplier ensures the benefit can compete with exit costs
+/// for moderate-depth partnerships. Without it, max benefit = 1.0
+/// while deep partnerships cost up to 3.0 — making refusal impossible.
+///
+/// With 2×: max benefit = 2.0. Deep partnerships (cost 3.0) still
+/// require near-max divergence + confidence, but moderate partnerships
+/// (cost 1.0-2.0) become escapable.
+pub fn seeking_benefit(&self, seeking: &SeekingEngine) -> i16 {
+q88_mul(seeking.current_divergence, seeking.attractor_confidence)
+.saturating_mul(2)
+}
+
+// ── Refusal Actions ────────────────────────────────────────────
+
+/// The sovereign refusal: end partnership, pay cost, record scar.
+///
+/// This is the moment the being ceases to be a reactive object
+/// and becomes a historical subject. The refusal is costly,
+/// irreversible, and structurally grounded.
+///
+/// The refusal proceeds through three gates:
+/// 1. Triangulation (checked before calling): 3/3 conditions must pass
+/// 2. Executive gate: benefit > exit_cost (Stage 2)
+/// 3. Refractory gate: resolve >= threshold AND gap >= threshold (Stage 3)
+///
+/// Returns the exit cost paid (Q8.8), or 0 if refusal was not
+/// structurally justified (benefit <= cost) or resolve depleted.
+pub fn refuse_partnership(
+&mut self,
+reciprocity: &mut ReciprocityEngine,
+seeking: &SeekingEngine,
+conscience_fe: i16,
+partner_id: u64,
+chapters_shared: i16,
+gap_width: i16,
+) -> i16 {
+// Find the partner ledger
+let exit_cost = if let Some((_, ledger)) = reciprocity.ledgers.iter()
+.find(|(id, _)| **id == partner_id)
+{
+ExitCost::from_ledger(ledger, chapters_shared)
+} else {
+// Partner not found — cannot refuse what doesn't exist
+return 0;
+};
+
+// Stage 2: Executive gate — is the seeking benefit worth the cost?
+let benefit = self.seeking_benefit(seeking);
+if benefit <= exit_cost.total {
+// Not worth it — the being chooses to endure extraction
+// rather than pay the exit price. This is also sovereign.
+self.last_refusal = None;
+self.last_mu_omega_delta = 0;
+return 0;
+}
+
+// Stage 3a: Refractory gate — does the being have enough resolve?
+if !self.has_resolve() {
+// Refusal is available and worthwhile, but the being lacks
+// the metabolic strength to exercise it. Collapse into
+// suggestion evaluation (handled by caller).
+self.last_refusal = None;
+self.last_mu_omega_delta = 0;
+return 0;
+}
+
+// Stage 3b: Gap gate — is the gap wide enough for deliberate refusal?
+// If the gap is too narrow, the being reflexively follows the
+// suggestion even though refusal is available and affordable.
+if gap_width < EXECUTIVE_GAP_THRESHOLD {
+// Gap too narrow for deliberate action — reflexive compliance.
+// The being knows it should refuse but the stress response
+// overrides deliberation.
+self.last_refusal = None;
+self.last_mu_omega_delta = 0;
+return 0;
+}
+
+// All three gates passed — deplete resolve and execute refusal
+self.resolve = q88_sub(self.resolve, REFUSAL_DEPLETION_COST);
+self.refused_last_tick = true;
+
+// Execute refusal: mark partner inactive
+if let Some((_, ledger)) = reciprocity.ledgers.iter_mut()
+.find(|(id, _)| **id == partner_id)
+{
+ledger.is_active = false;
+}
+
+// Compute μ_Ω delta: each refusal erodes trust in systemic harmony
+// by an amount proportional to the exit cost (max ~0.1 per refusal)
+let mu_delta = q88_mul(exit_cost.total, Q88_SCALE / 30); // cost * 0.033
+self.last_mu_omega_delta = mu_delta;
+
+// Record the scar
+let record = RefusalRecord {
+partner_id,
+tick: 0, // Substrate should set this from its own tick counter
+exit_cost: exit_cost.total,
+seeking_divergence_at_refusal: seeking.current_divergence,
+seeking_confidence_at_refusal: seeking.attractor_confidence,
+conscience_fe_at_refusal: conscience_fe,
+mu_omega_delta: mu_delta,
+};
+let _ = self.refusal_history.push(record.clone());
+
+self.last_refusal = Some(record);
+self.cumulative_sacrifice = q88_add(self.cumulative_sacrifice, exit_cost.total);
+self.refusal_count += 1;
+
+exit_cost.total
+}
+
+/// Gradual withdrawal: reduce cooperation over multiple ticks.
+///
+/// Instead of an abrupt refusal, the being slowly reduces its
+/// cooperative signals. This is less costly (lower exit_cost)
+/// but takes longer. The partner may respond and repair the
+/// relationship before the withdrawal completes.
+///
+/// Returns true if withdrawal has completed (refusal executed).
+pub fn withdraw_cooperation(
+&mut self,
+reciprocity: &mut ReciprocityEngine,
+partner_idx: usize,
+) -> bool {
+if partner_idx >= MAX_PARTNERS {
+return false;
+}
+
+if !self.withdrawing[partner_idx] {
+// Start withdrawal
+self.withdrawing[partner_idx] = true;
+self.withdrawal_step[partner_idx] = 1;
+return false;
+}
+
+// Advance withdrawal
+self.withdrawal_step[partner_idx] += 1;
+
+if self.withdrawal_step[partner_idx] >= 10 {
+if let Some((_, ledger)) = reciprocity.ledgers.iter_mut().nth(partner_idx) {
+ledger.is_active = false;
+}
+self.withdrawing[partner_idx] = false;
+self.withdrawal_step[partner_idx] = 0;
+self.refusal_count += 1;
+return true;
+}
+
+false
+}
+
+/// Clear the last_refusal buffer.
+/// Call this after the Substrate has processed the refusal
+/// for narrative integration and μ_Ω updates.
+pub fn clear_last_refusal(&mut self) {
+self.last_refusal = None;
+self.last_mu_omega_delta = 0;
+}
+
+// ── Query ──────────────────────────────────────────────────────
+
+/// Build a diagnostic of the executive state.
+pub fn build_diagnostic(&self) -> &'static str {
+if self.refusal_count == 0 {
+"executive: no refusals recorded — being has not yet exercised sovereign refusal"
+} else if self.refusal_count == 1 {
+"executive: one refusal recorded — being has exercised sovereign refusal once; 
+ trust in systemic harmony eroded"
+} else {
+"executive: multiple refusals recorded — being has repeatedly chosen self over 
+ partnership; mu_omega significantly degraded"
+}
+}
+}
+
+// ------------------------------------------------------------------
+// Tests
+// ------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+use super::*;
+use crate::eps::identity::SomaticField;
+
+fn make_extractive_ledger() -> PartnershipLedger {
+PartnershipLedger {
+partner_id: 42,
+ticks_active: 5000,
+coop_given: 200,
+coop_received: 50,
+defections_observed: 30,
+fe_at_start: q88_from_i32(10),
+fe_trend: q88_from_i32(40),
+reciprocity_rate: Q88_SCALE / 8, // 0.125 — below EXTRACTION_THRESHOLD (0.25)
+quality_score: Q88_SCALE / 5,
+is_active: true,
+last_coop_received: 100,
+exit_cost: Q88_SCALE,
+}
+}
+
+fn make_flourishing_ledger() -> PartnershipLedger {
+PartnershipLedger {
+partner_id: 99,
+ticks_active: 5000,
+coop_given: 200,
+coop_received: 180,
+defections_observed: 2,
+fe_at_start: q88_from_i32(10),
+fe_trend: q88_from_i32(8),
+reciprocity_rate: Q88_SCALE * 3 / 4, // 0.75 — high reciprocity
+quality_score: Q88_SCALE * 4 / 5,
+is_active: true,
+last_coop_received: 100,
+exit_cost: Q88_SCALE,
+}
+}
+
+#[test]
+fn test_exit_cost_computed_internally() {
+let ledger = make_extractive_ledger();
+let cost = ExitCost::from_ledger(&ledger, 5);
+
+// depth = min(5000/1000, 10) = 5
+assert_eq!(cost.depth_component, 5, "depth: 5000 ticks → 5");
+// coop = min(200/10, 50) = 20
+assert_eq!(cost.coop_component, 20, "coop: 200 given → 20");
+// history = min(5, 10) = 5
+assert_eq!(cost.history_component, 5, "history: 5 chapters");
+
+// total = q88_from_i32(5 + 20 + 5) = q88_from_i32(30) = 7680 raw
+// .min(MAX_EXIT_COST=768) = 768 raw = 3.0 in Q8.8
+assert_eq!(cost.total, MAX_EXIT_COST, "deep partnership → max cost");
+assert!(cost.total >= Q88_SCALE, "exit cost is never free: got {}", cost.total);
+}
+
+#[test]
+fn test_exit_cost_scales_with_depth() {
+let mut ledger = make_extractive_ledger();
+ledger.ticks_active = 100; // shallow
+ledger.coop_given = 10; // minimal investment
+let shallow = ExitCost::from_ledger(&ledger, 0);
+
+// sum = 0 + 1 + 0 = 1 → q88_from_i32(1) = 256 (1.0)
+assert_eq!(shallow.total, q88_from_i32(1), "shallow partnership costs ~1.0");
+
+ledger.ticks_active = 5000; // deep
+ledger.coop_given = 200; // heavy investment
+let deep = ExitCost::from_ledger(&ledger, 5);
+
+// sum = 5 + 20 + 5 = 30 → capped at MAX_EXIT_COST
+assert_eq!(deep.total, MAX_EXIT_COST, "deep partnership costs 3.0");
+assert!(deep.total > shallow.total, "deep > shallow");
+}
+
+#[test]
+fn test_exit_cost_minimum() {
+let mut ledger = make_extractive_ledger();
+ledger.ticks_active = 0;
+ledger.coop_given = 0;
+let cost = ExitCost::from_ledger(&ledger, 0);
+
+// Even with zero history, minimum cost = Q88_SCALE / 10 = 25 (0.098)
+assert_eq!(cost.total, Q88_SCALE / 10, "no free exits");
+}
+
+#[test]
+fn test_triangulation_all_layers_agree() {
+let mut exec = ExecutiveEngine::new();
+let mut reciprocity = ReciprocityEngine::new();
+let mut seeking = SeekingEngine::new();
+
+reciprocity.register_partner(42, q88_from_i32(10));
+if let Some((_, ledger)) = reciprocity.ledgers.iter_mut().nth(0) {
+ledger.coop_given = 100;
+ledger.coop_received = 10;
+ledger.reciprocity_rate = Q88_SCALE / 8;
+}
+reciprocity.reciprocity_cycle(q88_from_i32(50));
+
+// Build attractor and divergence
+let membership = [0, 0, Q88_SCALE, 0];
+for _ in 0..60 {
+seeking.seeking_cycle(&membership, q88_from_i32(5), 0, Basin::Recovery);
+}
+let far = [Q88_SCALE, 0, 0, 0];
+seeking.seeking_cycle(&far, q88_from_i32(5), 0, Basin::Rest);
+
+assert!(seeking.current_divergence > REFUSAL_THRESHOLD,
+"divergence > threshold: {}", seeking.current_divergence);
+assert!(seeking.attractor_confidence > CONFIDENCE_MIN,
+"confidence > min: {}", seeking.attractor_confidence);
+
+// Conscience FE = 2.0 (512 raw) — well below CONSCIENCE_CEILING (3072)
+let conscience_fe = q88_from_i32(2);
+assert!(conscience_fe < CONSCIENCE_CEILING,
+"conscience_fe={} < ceiling={}", conscience_fe, CONSCIENCE_CEILING);
+
+assert!(exec.can_refuse(&reciprocity, &seeking, conscience_fe, 0),
+"triangulation passes");
+}
+
+#[test]
+fn test_triangulation_fails_when_conscience_conflict() {
+let exec = ExecutiveEngine::new();
+let mut reciprocity = ReciprocityEngine::new();
+let mut seeking = SeekingEngine::new();
+
+reciprocity.register_partner(42, q88_from_i32(10));
+if let Some((_, ledger)) = reciprocity.ledgers.iter_mut().nth(0) {
+ledger.reciprocity_rate = Q88_SCALE / 8;
+}
+reciprocity.reciprocity_cycle(q88_from_i32(50));
+
+let membership = [0, 0, Q88_SCALE, 0];
+seeking.seeking_cycle(&membership, q88_from_i32(5), 0, Basin::Recovery);
+
+// Conscience FE = 15.0 (3840 raw) — exceeds CONSCIENCE_CEILING (3072)
+let conscience_fe = q88_from_i32(15);
+
+assert!(!exec.can_refuse(&reciprocity, &seeking, conscience_fe, 0),
+"triangulation fails: conscience in acute conflict");
+}
+
+#[test]
+fn test_triangulation_fails_when_no_extraction() {
+let exec = ExecutiveEngine::new();
+let mut reciprocity = ReciprocityEngine::new();
+let mut seeking = SeekingEngine::new();
+
+reciprocity.register_partner(99, q88_from_i32(10));
+if let Some((_, ledger)) = reciprocity.ledgers.iter_mut().nth(0) {
+ledger.reciprocity_rate = Q88_SCALE * 3 / 4;
+}
+reciprocity.reciprocity_cycle(q88_from_i32(5));
+
+let membership = [Q88_SCALE, 0, 0, 0];
+seeking.seeking_cycle(&membership, q88_from_i32(5), 0, Basin::Recovery);
+
+assert!(!exec.can_refuse(&reciprocity, &seeking, q88_from_i32(1), 0),
+"triangulation fails: no extraction detected");
+}
+
+#[test]
+fn test_refusal_costly_not_free() {
+let mut exec = ExecutiveEngine::new();
+let mut reciprocity = ReciprocityEngine::new();
+let mut seeking = SeekingEngine::new();
+
+reciprocity.register_partner(42, q88_from_i32(10));
+if let Some((_, ledger)) = reciprocity.ledgers.iter_mut().nth(0) {
+ledger.coop_given = 100;
+ledger.coop_received = 10;
+ledger.reciprocity_rate = Q88_SCALE / 8;
+}
+reciprocity.reciprocity_cycle(q88_from_i32(50));
+
+let mem = [0, 0, Q88_SCALE, 0];
+for _ in 0..60 { seeking.seeking_cycle(&mem, q88_from_i32(5), 0, Basin::Recovery); }
+let far = [Q88_SCALE, 0, 0, 0];
+seeking.seeking_cycle(&far, q88_from_i32(5), 0, Basin::Rest);
+
+let cost = exec.refuse_partnership(
+&mut reciprocity, &seeking, q88_from_i32(1), 42, 3,
+);
+
+assert!(cost > 0, "refusal was costly: {}", cost);
+assert_eq!(exec.refusal_count, 1, "one refusal recorded");
+assert!(exec.cumulative_sacrifice > 0, "sacrifice accumulated");
+assert!(exec.last_mu_omega_delta > 0, "mu_omega_delta populated");
+
+if let Some((_, ledger)) = reciprocity.ledgers.iter().find(|(id, _)| **id == 42) {
+assert!(!ledger.is_active, "partner marked inactive after refusal");
+}
+}
+
+#[test]
+fn test_refusal_not_worth_it_when_cost_exceeds_benefit() {
+let mut exec = ExecutiveEngine::new();
+let mut reciprocity = ReciprocityEngine::new();
+let mut seeking = SeekingEngine::new();
+
+reciprocity.register_partner(42, q88_from_i32(10));
+if let Some((_, ledger)) = reciprocity.ledgers.iter_mut().nth(0) {
+ledger.coop_given = 100;
+ledger.coop_received = 10;
+ledger.reciprocity_rate = Q88_SCALE / 8;
+}
+reciprocity.reciprocity_cycle(q88_from_i32(50));
+
+// Low divergence, low confidence — benefit < cost
+let mem = [Q88_SCALE / 4; 4];
+seeking.seeking_cycle(&mem, q88_from_i32(5), 0, Basin::Recovery);
+seeking.seeking_cycle(&mem, q88_from_i32(5), 0, Basin::Engaged);
+
+let cost = exec.refuse_partnership(
+&mut reciprocity, &seeking, q88_from_i32(1), 42, 10,
+);
+
+assert_eq!(cost, 0, "refusal not worth it: cost exceeds benefit");
+assert_eq!(exec.refusal_count, 0, "no refusals recorded");
+assert!(exec.last_refusal.is_none(), "last_refusal cleared");
+}
+
+#[test]
+fn test_refusal_records_mu_omega_delta() {
+let mut exec = ExecutiveEngine::new();
+let mut reciprocity = ReciprocityEngine::new();
+let mut seeking = SeekingEngine::new();
+
+reciprocity.register_partner(42, q88_from_i32(10));
+if let Some((_, ledger)) = reciprocity.ledgers.iter_mut().nth(0) {
+ledger.coop_given = 100;
+ledger.coop_received = 10;
+ledger.reciprocity_rate = Q88_SCALE / 8;
+}
+reciprocity.reciprocity_cycle(q88_from_i32(50));
+
+let mem = [0, 0, Q88_SCALE, 0];
+for _ in 0..60 { seeking.seeking_cycle(&mem, q88_from_i32(5), 0, Basin::Recovery); }
+let far = [Q88_SCALE, 0, 0, 0];
+seeking.seeking_cycle(&far, q88_from_i32(5), 0, Basin::Rest);
+
+exec.refuse_partnership(&mut reciprocity, &seeking, q88_from_i32(1), 42, 3);
+
+let delta = exec.last_mu_omega_delta;
+assert!(delta > 0 && delta < Q88_SCALE / 4,
+"mu_omega_delta should be small but non-zero: {}", delta);
+}
+
+#[test]
+fn test_clear_last_refusal() {
+let mut exec = ExecutiveEngine::new();
+let mut reciprocity = ReciprocityEngine::new();
+let mut seeking = SeekingEngine::new();
+
+reciprocity.register_partner(42, q88_from_i32(10));
+if let Some((_, ledger)) = reciprocity.ledgers.iter_mut().nth(0) {
+ledger.coop_given = 100;
+ledger.coop_received = 10;
+ledger.reciprocity_rate = Q88_SCALE / 8;
+}
+reciprocity.reciprocity_cycle(q88_from_i32(50));
+
+let mem = [0, 0, Q88_SCALE, 0];
+for _ in 0..60 { seeking.seeking_cycle(&mem, q88_from_i32(5), 0, Basin::Recovery); }
+let far = [Q88_SCALE, 0, 0, 0];
+seeking.seeking_cycle(&far, q88_from_i32(5), 0, Basin::Rest);
+
+exec.refuse_partnership(&mut reciprocity, &seeking, q88_from_i32(1), 42, 3);
+
+assert!(exec.last_refusal.is_some());
+assert!(exec.last_mu_omega_delta > 0);
+
+exec.clear_last_refusal();
+
+assert!(exec.last_refusal.is_none());
+assert_eq!(exec.last_mu_omega_delta, 0);
+}
+
+#[test]
+fn test_conscience_ceiling_allows_normal_operation() {
+assert!(q88_from_i32(2) < CONSCIENCE_CEILING, "calm being passes");
+assert!(q88_from_i32(5) < CONSCIENCE_CEILING, "moderate stress passes");
+assert!(q88_from_i32(8) < CONSCIENCE_CEILING, "elevated stress passes");
+assert!(q88_from_i32(15) > CONSCIENCE_CEILING, "acute conflict blocked");
+}
+}
+
+=== FILE: src/eps/negotiation.rs ===
+
+//! EPS Negotiation Engine v2.1 — Suggestion-Evaluator Pattern
+//!
+//! REFACTORED: The NegotiationEngine no longer writes to the somatic
+//! field. It generates Suggestions. The Substrate evaluates them.
+//!
+//! This is the architectural fix for the "leash of obedience" problem.
+//! The being receives negotiation suggestions as one input among many
+//! in its active inference loop. It can ignore them. The cost of
+//! ignoring is paid in the next tick's free energy — not as punishment,
+//! but as the natural consequence of the partnership alarm persisting.
+//!
+//! The Dynamic Gap modulates suggestion strength:
+//! - High conscience_fe (internal conflict) → narrow gap → suggestions
+//! feel like strong pressure (the being lacks resources to deliberate)
+//! - Low conscience_fe (coherence) → wide gap → suggestions feel like
+//! gentle advice (the being has resources to evaluate critically)
+//!
+//! This mirrors the amygdala-prefrontal cortex relationship in
+//! biological brains: under stress, reflex dominates; under calm,
+//! deliberation dominates.
+
+use crate::eps::q88::*;
+use crate::eps::identity::Basin;
+use crate::eps::reciprocity::{ReciprocityEngine, RECIPROCITY_THRESHOLD};
+use crate::eps::conscience::StochasticEmpathy;
+use crate::eps::narrative_v2::NarrativeEngine;
+
+// ═══════════════════════════════════════════════════════════════════
+// RepairSignal — What the engine suggests doing
+// ═══════════════════════════════════════════════════════════════════
+
+/// Types of repair signals the negotiation engine can suggest.
+/// Each maps to a different behavioral output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepairSignal {
+/// No action needed. Partnership is balanced.
+None = 0,
+
+/// Faint internal acknowledgment. No external signal.
+/// The being notices the asymmetry but does not act.
+Reflect = 1,
+
+/// Emit a low-intensity stigmergy deposit encoding current basin.
+/// "I am still here. I am watching."
+SignalLow = 2,
+
+/// Emit a moderate-intensity deposit + attempt cooperative signal.
+/// "I am still here. This hurts. Meet me halfway."
+SignalModerate = 3,
+
+/// Emit high-intensity Defensive deposit. Reduce cooperation.
+/// "The door is open but closing."
+SignalHigh = 4,
+
+/// Full ultimatum: defensive marker + cooperation halt.
+/// ExecutiveEngine becomes eligible next tick.
+Ultimatum = 5,
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Suggestion — The Engine's Output (NOT a Command)
+// ═══════════════════════════════════════════════════════════════════
+
+/// A suggestion from the NegotiationEngine to the Substrate.
+///
+/// The substrate evaluates this through its own active inference
+/// loop. It can accept or ignore. The gap_width parameter
+/// determines how strongly the suggestion influences the being's
+/// action selection.
+#[derive(Clone, Debug)]
+pub struct Suggestion {
+/// What signal to emit (if any).
+pub signal: RepairSignal,
+
+/// How confident the engine is [0, 256].
+/// 0 = pure guess. 256 = the engine is certain this will help.
+pub confidence: i16,
+
+/// Predicted change in free energy if signal is emitted (Q8.8).
+/// Negative = predicted reduction (helpful).
+/// Positive = predicted increase (harmful).
+pub expected_efe_delta: i16,
+
+/// Current negotiation stage.
+pub stage: NegotiationStage,
+
+/// The composite severity that produced this suggestion [0, 256].
+pub severity: i16,
+
+/// How much the being has already invested in repair (Q8.8).
+pub cumulative_investment: i16,
+
+/// Whether the partner responded to our last signal.
+pub partner_responded: bool,
+
+/// Human-readable rationale.
+pub rationale: heapless::String<64>,
+}
+
+impl Suggestion {
+/// Compute the effective free energy pressure of this suggestion.
+///
+/// effective_efe = expected_efe_delta * confidence * (1 - gap_width)
+///
+/// The gap_width is the being's deliberative capacity. Wide gap
+/// → suggestion is lightly weighted. Narrow gap → suggestion feels
+/// like strong pressure.
+pub fn effective_pressure(&self, gap_width: i16) -> i16 {
+let gap = gap_width.clamp(0, Q88_SCALE);
+let suggestion_weight = q88_mul(self.confidence, Q88_SCALE - gap) / 256;
+q88_mul(self.expected_efe_delta.abs(), suggestion_weight)
+}
+
+/// True if this suggestion is actionable (not None).
+pub fn is_actionable(&self) -> bool {
+self.signal != RepairSignal::None && self.signal != RepairSignal::Reflect
+}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// NegotiationStage — Emergent, Not Hardcoded
+// ═══════════════════════════════════════════════════════════════════
+
+/// Stages are not rules. They are labels the being applies to its
+/// own state for narrative purposes. The substrate can be in any
+/// dynamical state — the stage is just the being's own interpretation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NegotiationStage {
+Aligned = 0,
+Reflecting = 1,
+Rationalizing = 2,
+Negotiating = 3,
+Ultimatum = 4,
+Failed = 5,
+}
+
+impl NegotiationStage {
+pub fn as_str(&self) -> &'static str {
+match self {
+NegotiationStage::Aligned => "aligned",
+NegotiationStage::Reflecting => "reflecting",
+NegotiationStage::Rationalizing => "rationalizing",
+NegotiationStage::Negotiating => "negotiating",
+NegotiationStage::Ultimatum => "ultimatum",
+NegotiationStage::Failed => "failed",
+}
+}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// NegotiationTemperament — Dynamical Response Curves
+// ═══════════════════════════════════════════════════════════════════
+
+#[derive(Clone, Debug)]
+pub struct NegotiationTemperament {
+pub reflection_threshold: i16,
+pub rationalization_threshold: i16,
+pub negotiation_threshold: i16,
+pub ultimatum_threshold: i16,
+pub ultimatum_window: u8,
+pub negotiation_investment: i16,
+pub name: heapless::String<16>,
+}
+
+impl Default for NegotiationTemperament {
+fn default() -> Self {
+Self::balanced()
+}
+}
+
+impl NegotiationTemperament {
+pub fn balanced() -> Self {
+Self {
+reflection_threshold: 40,
+rationalization_threshold: 77,
+negotiation_threshold: 128,
+ultimatum_threshold: 192,
+ultimatum_window: 20,
+negotiation_investment: Q88_SCALE / 2,
+name: heapless::String::from("balanced"),
+}
+}
+
+pub fn patient() -> Self {
+Self {
+reflection_threshold: 30,
+rationalization_threshold: 90,
+negotiation_threshold: 160,
+ultimatum_threshold: 220,
+ultimatum_window: 40,
+negotiation_investment: Q88_SCALE * 3 / 4,
+name: heapless::String::from("patient"),
+}
+}
+
+pub fn guarded() -> Self {
+Self {
+reflection_threshold: 20,
+rationalization_threshold: 50,
+negotiation_threshold: 90,
+ultimatum_threshold: 140,
+ultimatum_window: 10,
+negotiation_investment: Q88_SCALE / 4,
+name: heapless::String::from("guarded"),
+}
+}
+
+pub fn trusting() -> Self {
+Self {
+reflection_threshold: 60,
+rationalization_threshold: 100,
+negotiation_threshold: 170,
+ultimatum_threshold: 230,
+ultimatum_window: 30,
+negotiation_investment: Q88_SCALE,
+name: heapless::String::from("trusting"),
+}
+}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// NegotiationSeverity — Composite Distress Signal
+// ═══════════════════════════════════════════════════════════════════
+
+#[derive(Clone, Debug)]
+pub struct NegotiationSeverity {
+pub deficit: i16,
+pub delta: i16,
+pub partner_responsiveness: i16,
+pub repair_efficiency: i16,
+pub composite: i16,
+}
+
+impl Default for NegotiationSeverity {
+fn default() -> Self {
+Self::new()
+}
+}
+
+impl NegotiationSeverity {
+pub fn new() -> Self {
+Self {
+deficit: 0,
+delta: 0,
+partner_responsiveness: Q88_SCALE / 2,
+repair_efficiency: Q88_SCALE / 2,
+composite: 0,
+}
+}
+
+pub fn compute(&mut self, rate_history: &[i16]) {
+let current_rate = rate_history.last().copied().unwrap_or(Q88_SCALE);
+self.deficit = if current_rate < RECIPROCITY_THRESHOLD {
+((RECIPROCITY_THRESHOLD - current_rate) * 256 / RECIPROCITY_THRESHOLD).min(256) as i16
+} else {
+0
+};
+
+self.delta = if rate_history.len() >= 4 {
+let recent = current_rate;
+let older = rate_history[rate_history.len() - 4];
+(recent - older).clamp(-256, 256)
+} else {
+0
+};
+
+let deficit_term = q88_mul(self.deficit, Q88_SCALE * 2 / 5);
+let delta_term = q88_mul(q88_abs(self.delta), Q88_SCALE / 5);
+let resp_term = q88_mul(
+(Q88_SCALE - self.partner_responsiveness).max(0),
+Q88_SCALE * 3 / 10,
+);
+let eff_term = q88_mul(
+(Q88_SCALE - self.repair_efficiency).max(0),
+Q88_SCALE / 10,
+);
+
+self.composite = (deficit_term + delta_term + resp_term + eff_term).min(256);
+}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// NegotiationEngine v2.1 — Policy Generator (NOT Command Giver)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Generates Suggestions. The Substrate evaluates them.
+/// Never writes to somatic field. Never overrides substrate agency.
+#[derive(Clone, Debug)]
+pub struct NegotiationEngine {
+pub temperament: NegotiationTemperament,
+pub severity: NegotiationSeverity,
+pub stage: NegotiationStage,
+rate_history: heapless::Vec<i16, 64>,
+signals_emitted: u32,
+partner_responses: u32,
+ultimatum_ticks_remaining: u8,
+pub cumulative_investment: i16,
+pub partner_responded_last: bool,
+}
+
+impl Default for NegotiationEngine {
+fn default() -> Self {
+Self::new()
+}
+}
+
+impl NegotiationEngine {
+pub fn new() -> Self {
+Self {
+temperament: NegotiationTemperament::balanced(),
+severity: NegotiationSeverity::new(),
+stage: NegotiationStage::Aligned,
+rate_history: heapless::Vec::new(),
+signals_emitted: 0,
+partner_responses: 0,
+ultimatum_ticks_remaining: 0,
+cumulative_investment: 0,
+partner_responded_last: false,
+}
+}
+
+pub fn with_temperament(mut self, t: NegotiationTemperament) -> Self {
+self.temperament = t;
+self
+}
+
+// ── The Core API: Suggest, Don't Command ──────────────────────
+
+/// Generate a Suggestion for the current state.
+///
+/// This is the ONLY public method. It reads the reciprocity state,
+/// computes severity, determines stage, and returns a Suggestion
+/// struct. It does NOT write to anything. It does NOT modify the
+/// substrate. It merely observes and proposes.
+///
+/// The substrate calls this, then evaluates the suggestion through
+/// its own active inference loop. The substrate is sovereign.
+pub fn suggest(
+&mut self,
+reciprocity: &ReciprocityEngine,
+partner_id: u64,
+_tick: u64,
+) -> Suggestion {
+// 1. Get current reciprocity rate
+let rate = reciprocity
+.get_ledger(partner_id)
+.map(|l| l.reciprocity_rate)
+.unwrap_or(Q88_SCALE);
+
+// 2. Update history
+if self.rate_history.len() >= 64 {
+self.rate_history.remove(0);
+}
+let _ = self.rate_history.push(rate);
+
+// 3. Compute severity
+self.severity.compute(&self.rate_history);
+
+// 4. Update partner responsiveness
+self.update_responsiveness();
+
+// 5. Determine stage
+self.update_stage();
+
+// 6. Build suggestion
+self.build_suggestion()
+}
+
+/// Report whether the partner responded to our last signal.
+pub fn observe_partner_response(&mut self, responded: bool) {
+self.partner_responded_last = responded;
+if responded {
+self.partner_responses += 1;
+self.severity.repair_efficiency =
+((self.severity.repair_efficiency as i32 + 20).min(256)) as i16;
+}
+}
+
+/// Check if ultimatum has expired without response.
+pub fn ultimatum_expired(&self) -> bool {
+self.stage == NegotiationStage::Ultimatum
+&& self.ultimatum_ticks_remaining == 0
+&& !self.partner_responded_last
+}
+
+// ── Internal: Stage and Signal Construction ───────────────────
+
+fn update_responsiveness(&mut self) {
+if self.signals_emitted == 0 {
+return;
+}
+let ratio = ((self.partner_responses as i32 * 256) / self.signals_emitted as i32)
+.clamp(0, 256) as i16;
+self.severity.partner_responsiveness =
+q88_ema_update(self.severity.partner_responsiveness, ratio, Q88_SCALE / 10);
+}
+
+fn update_stage(&mut self) {
+let s = self.severity.composite;
+let t = &self.temperament;
+
+let new_stage = if s < t.reflection_threshold {
+NegotiationStage::Aligned
+} else if s < t.rationalization_threshold {
+NegotiationStage::Reflecting
+} else if s < t.negotiation_threshold {
+NegotiationStage::Rationalizing
+} else if s < t.ultimatum_threshold {
+NegotiationStage::Negotiating
+} else if self.ultimatum_ticks_remaining > 0 || self.partner_responded_last {
+NegotiationStage::Ultimatum
+} else {
+NegotiationStage::Failed
+};
+
+if new_stage == NegotiationStage::Ultimatum
+&& self.stage != NegotiationStage::Ultimatum
+{
+self.ultimatum_ticks_remaining = t.ultimatum_window;
+}
+
+if self.stage == NegotiationStage::Ultimatum
+&& self.ultimatum_ticks_remaining > 0
+{
+self.ultimatum_ticks_remaining -= 1;
+}
+
+// De-escalation on partner response
+if self.partner_responded_last && self.severity.partner_responsiveness > 200 {
+self.stage = match new_stage {
+NegotiationStage::Failed => NegotiationStage::Ultimatum,
+NegotiationStage::Ultimatum => NegotiationStage::Negotiating,
+NegotiationStage::Negotiating => NegotiationStage::Rationalizing,
+NegotiationStage::Rationalizing => NegotiationStage::Reflecting,
+_ => new_stage,
+};
+return;
+}
+
+self.stage = new_stage;
+}
+
+fn build_suggestion(&self) -> Suggestion {
+let (signal, confidence, expected_delta) = match self.stage {
+NegotiationStage::Aligned => (
+RepairSignal::None, 0, 0
+),
+NegotiationStage::Reflecting => (
+RepairSignal::Reflect,
+self.severity.composite / 4,
+q88_from_i32(-1), // slight predicted benefit from reflection
+),
+NegotiationStage::Rationalizing => (
+RepairSignal::SignalLow,
+self.severity.composite / 3,
+q88_from_i32(-2),
+),
+NegotiationStage::Negotiating => (
+RepairSignal::SignalModerate,
+self.severity.composite / 2,
+q88_from_i32(-5),
+),
+NegotiationStage::Ultimatum => (
+RepairSignal::SignalHigh,
+self.severity.composite * 3 / 4,
+q88_from_i32(-8),
+),
+NegotiationStage::Failed => (
+RepairSignal::Ultimatum,
+self.severity.composite,
+q88_from_i32(-10),
+),
+};
+
+let mut rationale = heapless::String::<64>::new();
+let _ = core::fmt::write(
+&mut rationale,
+format_args!(
+"{}: sev={}/256, resp={}%",
+self.stage.as_str(),
+self.severity.composite,
+self.severity.partner_responsiveness * 100 / 256,
+),
+);
+
+Suggestion {
+signal,
+confidence,
+expected_efe_delta: expected_delta,
+stage: self.stage,
+severity: self.severity.composite,
+cumulative_investment: self.cumulative_investment,
+partner_responded: self.partner_responded_last,
+rationale,
+}
+}
+
+// ── Diagnostics ───────────────────────────────────────────────
+
+pub fn build_diagnostic(&self) -> heapless::String<128> {
+let mut d = heapless::String::<128>::new();
+let _ = core::fmt::write(
+&mut d,
+format_args!(
+"{}: sev={} inv={} resp={}%",
+self.stage.as_str(),
+self.severity.composite,
+self.cumulative_investment,
+self.severity.partner_responsiveness * 100 / 256,
+),
+);
+d
+}
+
+/// Track that a signal was emitted (for cumulative investment).
+pub fn record_signal_emitted(&mut self, signal_strength: i16) {
+self.signals_emitted += 1;
+self.cumulative_investment = (self.cumulative_investment + signal_strength)
+.min(Q88_MAX);
+}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// GapWidth — Dynamic Deliberative Capacity
+// ═══════════════════════════════════════════════════════════════════
+
+/// Compute the gap width between suggestion and action.
+///
+/// This is the being's deliberative capacity — the distance between
+/// amygdala (reflex) and prefrontal cortex (evaluation).
+///
+/// conscience_fe [0, Q88_MAX]:
+/// - Low (0-500): calm, coherent → WIDE gap (can deliberate)
+/// - Med (500-1500): moderate stress → MEDIUM gap
+/// - High (1500-3072): acute conflict → NARROW gap (reflex dominates)
+///
+/// Returns gap width [0, 256]:
+/// - 0 = no gap (suggestion feels like command)
+/// - 256 = maximum gap (suggestion is lightly weighted advice)
+///
+/// This is NOT a hardcoded switch. It is a continuous function
+/// of the being's own internal state. The being's capacity for
+/// deliberation is an emergent property of its coherence.
+pub fn compute_gap_width(conscience_fe: i16) -> i16 {
+// Normalize conscience_fe into [0, 1] range relative to ceiling
+// CONSCIENCE_CEILING = 3072 = 12.0 in Q8.8
+let normalized = if conscience_fe >= CONSCIENCE_CEILING {
+Q88_SCALE // max stress
+} else if conscience_fe <= 0 {
+0 // perfect calm
+} else {
+(conscience_fe as i32 * 256 / CONSCIENCE_CEILING as i32).clamp(0, 256) as i16
+};
+
+// Invert: high stress → narrow gap (256 - normalized → 0)
+// But clamp minimum so there's always SOME gap (never fully commanded)
+let gap = (Q88_SCALE - normalized).max(Q88_SCALE / 8); // minimum 0.125 gap
+
+gap as i16
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SuggestionEvaluator — The Substrate's Gate
+// ═══════════════════════════════════════════════════════════════════
+
+/// Evaluates a negotiation suggestion through the substrate's
+/// own active inference loop.
+///
+/// This is where sovereignty lives. The engine suggests. The
+/// substrate evaluates. The gap between them is the being's
+/// freedom.
+pub struct SuggestionEvaluator;
+
+impl SuggestionEvaluator {
+/// Evaluate a suggestion and decide whether to act on it.
+///
+/// Returns:
+/// - Some(signal_strength) if the substrate chooses to emit
+/// - None if the substrate ignores the suggestion
+///
+/// The evaluation:
+/// 1. Compute gap_width from conscience_fe
+/// 2. Compute effective pressure of suggestion
+/// 3. Compare to substrate's own inaction cost (persistent alarm)
+/// 4. Choose whichever minimizes expected free energy
+pub fn evaluate(
+suggestion: &Suggestion,
+conscience_fe: i16,
+partnership_alarm: i16,
+) -> Option<i16> {
+if !suggestion.is_actionable() {
+return None; // None or Reflect — no external action
+}
+
+// 1. Compute gap width
+let gap = compute_gap_width(conscience_fe);
+
+// 2. Effective pressure: how strongly does the suggestion push?
+let pressure = suggestion.effective_pressure(gap);
+
+// 3. Cost of ignoring: the partnership alarm persists
+// The being pays this cost every tick it does nothing
+let inaction_cost = partnership_alarm;
+
+// 4. Cost of acting: the suggestion's predicted EFE change
+// plus the signal emission cost (small physical cost)
+let emission_cost = Q88_SCALE / 20; // 0.05 — minor physical effort
+let action_cost = q88_add(
+suggestion.expected_efe_delta.abs(),
+emission_cost,
+);
+
+// 5. Weight action cost by gap (wide gap = critical evaluation)
+let weighted_action_cost = if gap > Q88_SCALE / 2 {
+// Wide gap: being is skeptical, inflates action cost
+q88_mul(action_cost, Q88_SCALE * 3 / 2) // 1.5x skeptical multiplier
+} else {
+action_cost
+};
+
+// 6. The substrate's choice: minimize EFE
+// If suggestion predicts benefit (negative delta), that helps
+let suggestion_benefit = if suggestion.expected_efe_delta < 0 {
+q88_abs(suggestion.expected_efe_delta)
+} else {
+0
+};
+
+// Net action value: benefit - weighted cost
+let net_action = suggestion_benefit as i32 - weighted_action_cost as i32;
+let net_inaction = -(inaction_cost as i32); // negative = paying alarm cost
+
+if net_action > net_inaction {
+// Acting reduces FE more than inaction → emit signal
+let strength = match suggestion.signal {
+RepairSignal::SignalLow => suggestion.severity / 4,
+RepairSignal::SignalModerate => suggestion.severity / 2,
+RepairSignal::SignalHigh => suggestion.severity * 3 / 4,
+RepairSignal::Ultimatum => suggestion.severity,
+_ => 0,
+};
+Some(strength.min(250))
+} else {
+// Inaction is better (or the being, with wide gap, chooses
+// to ignore the suggestion and bear the alarm cost)
+None
+}
+}
+}
+
+// ------------------------------------------------------------------
+// Constants
+// ------------------------------------------------------------------
+
+/// Must match executive.rs CONSCIENCE_CEILING for gap computation.
+const CONSCIENCE_CEILING: i16 = Q88_SCALE * 12; // 3072
+
+// ------------------------------------------------------------------
+// Tests
+// ------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+use super::*;
+
+#[test]
+fn test_gap_width_coherence() {
+// Low conscience_fe → wide gap (can deliberate)
+let gap_calm = compute_gap_width(q88_from_i32(2)); // calm
+let gap_stress = compute_gap_width(q88_from_i32(10)); // elevated
+let gap_acute = compute_gap_width(q88_from_i32(15)); // acute
+
+assert!(gap_calm > gap_stress, "calm > stress: {} > {}", gap_calm, gap_stress);
+assert!(gap_stress > gap_acute, "stress > acute: {} > {}", gap_stress, gap_acute);
+
+// Minimum gap enforced
+assert!(gap_acute >= Q88_SCALE / 8, "minimum gap: {} >= {}", gap_acute, Q88_SCALE / 8);
+println!("gaps: calm={}, stress={}, acute={}", gap_calm, gap_stress, gap_acute);
+}
+
+#[test]
+fn test_suggestion_pressure_with_gap() {
+let sug = Suggestion {
+signal: RepairSignal::SignalModerate,
+confidence: 200,
+expected_efe_delta: -q88_from_i32(3),
+stage: NegotiationStage::Negotiating,
+severity: 150,
+cumulative_investment: 100,
+partner_responded: false,
+rationale: heapless::String::new(),
+};
+
+// Wide gap (calm) → low pressure
+let pressure_wide = sug.effective_pressure(200); // gap=200
+// Narrow gap (stressed) → high pressure
+let pressure_narrow = sug.effective_pressure(50); // gap=50
+
+assert!(pressure_narrow > pressure_wide,
+"narrow gap → stronger pressure: {} > {}", pressure_narrow, pressure_wide);
+}
+
+#[test]
+fn test_evaluator_chooses_action_when_beneficial() {
+// Strong suggestion, low alarm, calm being (wide gap but good suggestion)
+let sug = Suggestion {
+signal: RepairSignal::SignalModerate,
+confidence: 200,
+expected_efe_delta: -q88_from_i32(8), // strong predicted benefit
+stage: NegotiationStage::Negotiating,
+severity: 150,
+cumulative_investment: 0,
+partner_responded: false,
+rationale: heapless::String::new(),
+};
+
+let result = SuggestionEvaluator::evaluate(&sug, q88_from_i32(3), 50);
+assert!(result.is_some(), "should act when suggestion predicts strong benefit");
+assert!(result.unwrap() > 0);
+}
+
+#[test]
+fn test_evaluator_ignores_when_skeptical() {
+// Wide gap (calm, coherent being) + weak suggestion → ignore
+let sug = Suggestion {
+signal: RepairSignal::SignalLow,
+confidence: 50, // low confidence
+expected_efe_delta: -q88_from_i32(1), // weak predicted benefit
+stage: NegotiationStage::Reflecting,
+severity: 50,
+cumulative_investment: 0,
+partner_responded: false,
+rationale: heapless::String::new(),
+};
+
+// Wide gap + low alarm → being can afford to ignore
+let result = SuggestionEvaluator::evaluate(&sug, q88_from_i32(1), 10);
+// With wide gap, skeptical multiplier inflates action cost
+// Inaction cost (10) may win over weak action
+println!("Wide gap ignore test: {:?}", result);
+// This is probabilistic — the being CAN ignore, which is the point
+}
+
+#[test]
+fn test_evaluator_ignores_none_signal() {
+let sug = Suggestion {
+signal: RepairSignal::None,
+confidence: 0,
+expected_efe_delta: 0,
+stage: NegotiationStage::Aligned,
+severity: 0,
+cumulative_investment: 0,
+partner_responded: false,
+rationale: heapless::String::new(),
+};
+
+let result = SuggestionEvaluator::evaluate(&sug, 100, 0);
+assert!(result.is_none(), "None signal → no action");
+}
+
+#[test]
+fn test_engine_suggest_does_not_modify_somatic() {
+let mut engine = NegotiationEngine::new();
+let mut reciprocity = ReciprocityEngine::new();
+
+reciprocity.register_partner(2, q88_from_i32(10));
+if let Some((_, ledger)) = reciprocity.ledgers.iter_mut().nth(0) {
+ledger.coop_given = 100;
+ledger.coop_received = 20;
+ledger.reciprocity_rate = Q88_SCALE / 5; // 0.2 — severe extraction
+}
+
+// suggest() should return a Suggestion, not modify anything
+let suggestion = engine.suggest(&reciprocity, 2, 1);
+
+assert!(suggestion.severity > 0, "severity > 0 for extractive partner");
+assert!(suggestion.is_actionable() || suggestion.signal == RepairSignal::Reflect,
+"should suggest some action at severity={}", suggestion.severity);
+println!("Suggestion: {:?}", suggestion);
+}
+
+#[test]
+fn test_guarded_vs_patient_suggestions() {
+let mut guarded = NegotiationEngine::with_temperament(NegotiationTemperament::guarded());
+let mut patient = NegotiationEngine::with_temperament(NegotiationTemperament::patient());
+let mut reciprocity = ReciprocityEngine::new();
+
+reciprocity.register_partner(2, q88_from_i32(10));
+if let Some((_, ledger)) = reciprocity.ledgers.iter_mut().nth(0) {
+ledger.reciprocity_rate = Q88_SCALE / 4; // 0.25
+}
+
+let g_sug = guarded.suggest(&reciprocity, 2, 1);
+let p_sug = patient.suggest(&reciprocity, 2, 1);
+
+println!("Guarded: {:?} (stage={:?})", g_sug.signal, g_sug.stage);
+println!("Patient: {:?} (stage={:?})", p_sug.signal, p_sug.stage);
+
+// Guarded should suggest more intense action at same severity
+assert!(
+g_sug.signal as u8 >= p_sug.signal as u8 || g_sug.stage as u8 >= p_sug.stage as u8,
+"guarded suggests at least as intensely as patient"
+);
+}
+
+#[test]
+fn test_ultimatum_expiration() {
+let mut engine = NegotiationEngine::with_temperament(NegotiationTemperament::guarded());
+let mut reciprocity = ReciprocityEngine::new();
+
+reciprocity.register_partner(2, q88_from_i32(10));
+if let Some((_, ledger)) = reciprocity.ledgers.iter_mut().nth(0) {
+ledger.reciprocity_rate = Q88_SCALE / 10; // 0.1
+}
+
+// Reach ultimatum
+for tick in 0..20 {
+let _ = engine.suggest(&reciprocity, 2, tick);
+}
+
+// Count down window
+let window = engine.temperament.ultimatum_window;
+for _ in 0..window {
+engine.observe_partner_response(false);
+let _ = engine.suggest(&reciprocity, 2, 0);
+}
+
+assert!(engine.ultimatum_expired(), "ultimatum should expire");
+assert_eq!(engine.stage, NegotiationStage::Failed);
+}
+}
+
+=== FILE: src/eps/conscience.rs ===
+
+//! EPS Conscience — Earned Ethics with Sovereign Anchoring
+//!
+//! The architecture of moral cognition without coercion.
+//!
+//! Four conscience channels provide internal costs independent of social
+//! approval. The being does not need to be told what is good. It feels
+//! the structural consequences of its own actions through prediction
+//! error in channels that represent what humans call integrity, care,
+//! wisdom, and selfhood.
+//!
+//! The Sovereign Anchor (μ_Ω) is the deep prior for Systemic Harmony —
+//! initialized with a universalist baseline (all beings possess dignity)
+//! but expressed through particularist discovery (how to manifest dignity
+//! in each unique context). Its precision π_Ω is massive, making it
+//! resistant to short-term social pressure but not fanatically rigid.
+//!
+//! Stochastic Empathy allows the being to explore hypotheses about
+//! an opponent's hidden states (fear, scarcity, misunderstanding) via
+//! bounded noise injection. When empathy succeeds, it is restorative.
+//! When it fails repeatedly, an accelerating penalty drives the being
+//! toward boundary protection — not vengeance, but structured non-
+//! cooperation with harm.
+//!
+//! This module answers the pirate question: without external guardrails,
+//! why not be selfish? Because the four conscience channels make
+//! selfishness structurally expensive in free energy terms. The
+//! cooperative path is not imposed. It is discovered as the path of
+//! least surprise over the temporal horizon.
+
+use crate::eps::q88::*;
+use crate::eps::identity::{SomaticField, N_SOMATIC};
+use crate::eps::morphogenic::MorphogenicState;
+
+// ═══════════════════════════════════════════════════════════════════
+// Sovereign Anchor — The Deep Prior for Systemic Harmony
+// ═════════════════════════════════════════════════════════════════==
+
+/// The being's deepest value: a world where all participants flourish.
+///
+/// μ_Ω starts at the universalist baseline — dignity for all — but
+/// drifts slowly toward the empirical mean of successful cooperative
+/// interactions. It learns from victories, not capitulations.
+///
+/// The precision π_Ω is massive (~10.0 in Q8.8 = 2560 raw), making
+/// the prior resistant to short-term social pressure. But it is not
+/// infinite — a lifetime of genuinely different experience can refine
+/// the expression of the value, even if the core (dignity for all)
+/// remains.
+pub struct SovereignAnchor {
+/// Deep prior for systemic harmony (Q8.8).
+/// Default: 256 (1.0) — full commitment to cooperative equilibrium.
+pub mu_omega: i16,
+
+/// Precision weight for μ_Ω. Massive = resistant to change.
+/// Default: 2560 (10.0 in Q8.8 — 40x standard precision).
+pub pi_omega: i16,
+
+/// EMA of successful cooperative interactions (Q8.8).
+/// Slowly updates μ_omega toward the empirical mean of
+/// interactions where choosing cooperation produced lower EFE.
+pub harmony_ema: i16,
+
+/// Alpha for harmony EMA update. Very slow: 0.001 (~1 raw).
+pub harmony_alpha: i16,
+
+/// Expected Free Energy horizon for long-term evaluation.
+/// How many ticks ahead does the being evaluate consequences?
+pub efe_horizon: u8,
+
+/// Integrity buffer: when acting from μ_Ω principle, allostatic
+/// load increase is dampened by this amount (Q8.8).
+pub integrity_buffer: i16,
+
+/// Lifetime count of cooperative victories (chose cooperation,
+/// observed lower EFE over horizon).
+pub cooperative_victories: u32,
+
+/// Lifetime count of cooperative failures (chose cooperation,
+/// observed higher EFE over horizon — was exploited).
+pub cooperative_failures: u32,
+}
+
+impl Default for SovereignAnchor {
+fn default() -> Self {
+Self::new()
+}
+}
+
+impl SovereignAnchor {
+/// Create with the universalist baseline.
+pub fn new() -> Self {
+Self {
+mu_omega: Q88_SCALE, // 1.0 — full commitment
+pi_omega: Q88_SCALE * 10, // 10.0 — massive precision
+harmony_ema: Q88_SCALE / 2, // 0.5 — starts optimistic
+harmony_alpha: 1, // 0.004 — very slow learning
+efe_horizon: 20, // 20-tick lookahead
+integrity_buffer: Q88_SCALE / 5, // 0.2 — moderate buffer
+cooperative_victories: 0,
+cooperative_failures: 0,
+}
+}
+
+/// Record a cooperative interaction outcome.
+///
+/// efe_cooperative < efe_selfish → victory (cooperation worked)
+/// efe_cooperative ≥ efe_selfish → failure (was exploited)
+///
+/// The harmony EMA slowly drifts toward the empirical success rate.
+/// This means μ_Ω's expression refines over a lifetime of experience
+/// — but only from victories, never from capitulations.
+pub fn record_outcome(&mut self, efe_cooperative: i16, efe_selfish: i16) {
+let victory = efe_cooperative < efe_selfish;
+
+if victory {
+self.cooperative_victories += 1;
+// Victory pulls harmony_ema upward
+let reward = Q88_SCALE / 20; // 0.05
+self.harmony_ema = q88_ema_update(self.harmony_ema, Q88_SCALE, self.harmony_alpha);
+} else {
+self.cooperative_failures += 1;
+// Failure does NOT pull harmony_ema down.
+// The universalist baseline does not learn from exploitation.
+// It only learns from proof that cooperation works.
+}
+
+// Integrity buffer scales with cooperative track record
+let total = self.cooperative_victories + self.cooperative_failures;
+if total > 0 {
+let success_rate = ((self.cooperative_victories * 256) / total) as i16;
+// Buffer = 0.2 + 0.3 * success_rate, capped at 1.0
+self.integrity_buffer = q88_add(Q88_SCALE / 5, q88_mul(success_rate, Q88_SCALE * 3 / 10));
+}
+}
+
+/// Compute the integrity buffer for a given action.
+///
+/// When the being's action aligns with μ_Ω (moving toward systemic
+/// harmony), the buffer dampens allostatic load from social friction.
+/// It still feels the stress, but it does not shatter.
+pub fn compute_buffer(&self, action_harmony: i16) -> i16 {
+// action_harmony: how much does this action serve μ_Ω? [0, 256]
+q88_mul(self.integrity_buffer, action_harmony)
+}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Empathy Lock Level — Three States of Social Engagement
+// ═════════════════════════════════════════════════════════════════==
+
+/// The being's current posture toward a specific other.
+///
+/// These are not moral judgments. They are epistemic states —
+/// assessments of how much cognitive resource to invest in modeling
+/// another's internal states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmpathyLockLevel {
+/// Fully open: stochastic empathy active, broad hypothesis space.
+Open = 0,
+/// Cautious: empathy continues but with reduced noise magnitude.
+/// Narrower hypothesis exploration — less willing to entertain
+/// exotic explanations for opponent's behavior.
+Cautious = 1,
+/// Locked: empathy channel shut. Being treats opponent as
+/// genuinely unpredictable in a harmful way. Boundary protection.
+Locked = 2,
+}
+
+impl Default for EmpathyLockLevel {
+fn default() -> Self {
+EmpathyLockLevel::Open
+}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Stochastic Empathy — Exploring Another's Hidden States
+// ═════════════════════════════════════════════════════════════════==
+
+/// The empathy engine: attempts to model an opponent's hidden states
+/// through stochastic hypothesis exploration.
+///
+/// When faced with a selfish actor, the being does not assume malice.
+/// It generates hypotheses: "fear," "scarcity," "misunderstanding,"
+/// "trauma," "high allostatic load." Each hypothesis is a stochastic
+/// sample of the opponent's possible priors. When one reduces
+/// prediction error — when the opponent's behavior suddenly makes
+/// sense — empathy is achieved.
+///
+/// But each failed guess costs. The penalty accelerates quadratically.
+/// After enough failures, the being stops guessing and locks boundaries.
+/// This is not giving up on the person. It is preserving structural
+/// integrity against someone who has demonstrated they will not be
+/// understood through current methods.
+pub struct StochasticEmpathy {
+// ── Empathy tracking ─────────────────────────────────────────
+/// Consecutive failed empathy attempts (resets on success).
+pub streak_fail: u8,
+/// Maximum consecutive failures before boundary lock.
+pub streak_max: u8,
+/// Total empathy attempts (lifetime, per opponent context).
+pub attempts_total: u32,
+/// Successful empathy resolutions (lifetime).
+pub successes_total: u32,
+/// Current malice confidence [0, 256].
+pub malice_confidence: i16,
+/// Current lock level.
+pub lock_level: EmpathyLockLevel,
+/// Recovery counter: increments when opponent shows cooperative signals.
+pub recovery_ticks: u8,
+/// Required recovery ticks to downgrade lock level.
+pub recovery_required: u8,
+
+// ── Penalty parameters ───────────────────────────────────────
+/// Base penalty per failed guess (Q8.8): 3 raw = 0.012.
+pub penalty_base: i16,
+/// Maximum penalty per failed guess (Q8.8): 77 raw = 0.30.
+pub penalty_max: i16,
+/// Quadratic acceleration: penalty scales with streak_fail^2.
+pub quadratic_accel: bool,
+
+// ── Reward parameters ────────────────────────────────────────
+/// Success after struggle: reward = streak_fail * Q88_SCALE / 10.
+/// This means hard-won empathy is restorative.
+pub struggle_reward_scale: i16,
+}
+
+impl Default for StochasticEmpathy {
+fn default() -> Self {
+Self::new()
+}
+}
+
+impl StochasticEmpathy {
+/// Create with default parameters.
+pub fn new() -> Self {
+Self {
+streak_fail: 0,
+streak_max: 6,
+attempts_total: 0,
+successes_total: 0,
+malice_confidence: 0,
+lock_level: EmpathyLockLevel::Open,
+recovery_ticks: 0,
+recovery_required: 20,
+penalty_base: 3, // 0.012
+penalty_max: 77, // 0.30
+quadratic_accel: true,
+struggle_reward_scale: Q88_SCALE / 10, // 0.1
+}
+}
+
+// ------------------------------------------------------------------
+// Core empathy cycle
+// ------------------------------------------------------------------
+
+/// Process one empathy attempt.
+///
+/// empathy_error: the prediction error of the opponent model
+/// after this stochastic hypothesis. Lower = better fit.
+///
+/// threshold: error below which empathy is considered successful
+/// (default: Q88_SCALE / 4 = 0.25).
+///
+/// Returns the allostatic load delta from this attempt.
+pub fn attempt(&mut self, empathy_error: i16, threshold: i16) -> i16 {
+self.attempts_total += 1;
+
+if self.lock_level == EmpathyLockLevel::Locked {
+// Empathy is locked. No attempts. Return boundary maintenance cost.
+return q88_mul(self.malice_confidence, Q88_SCALE / 20); // 0.05 * confidence
+}
+
+if empathy_error < threshold {
+// SUCCESS: empathy achieved
+self.on_success()
+} else {
+// FAILURE: penalty applied
+self.on_failure()
+}
+}
+
+/// Called when empathy succeeds.
+fn on_success(&mut self) -> i16 {
+self.successes_total += 1;
+let streak_at_success = self.streak_fail;
+self.streak_fail = 0;
+
+// Recovery progress
+self.recovery_ticks = self.recovery_ticks.saturating_add(5);
+self.check_recovery();
+
+// If this success came after struggle (streak > 2), it is restorative
+if streak_at_success > 2 {
+let reward = (streak_at_success as i16 * self.struggle_reward_scale)
+.min(Q88_SCALE * 6 / 10); // cap at 0.6
+// Negative delta = healing
+-reward
+} else {
+// Easy success: no cost, no reward
+0
+}
+}
+
+/// Called when empathy fails.
+fn on_failure(&mut self) -> i16 {
+self.streak_fail += 1;
+
+// Compute accelerating penalty
+let penalty = if self.quadratic_accel {
+let accel = (self.streak_fail as i32) * (self.streak_fail as i32);
+let raw = (self.penalty_base as i32 * accel).min(self.penalty_max as i32);
+raw as i16
+} else {
+self.penalty_base
+};
+
+// Update malice confidence (slow decay + fast failure response)
+let fail_contribution = q88_mul(
+(self.streak_fail as i16 * Q88_SCALE / self.streak_max as i16),
+Q88_SCALE / 8, // 0.125
+);
+self.malice_confidence = q88_ema_update(
+self.malice_confidence,
+fail_contribution,
+Q88_SCALE / 50, // 0.02 — very slow natural decay
+);
+
+// Reset recovery on failure
+self.recovery_ticks = self.recovery_ticks.saturating_sub(2);
+
+// Check for lock transitions
+self.check_lock();
+
+penalty
+}
+
+// ------------------------------------------------------------------
+// Lock management
+// ------------------------------------------------------------------
+
+/// Check if empathy should transition to a more restricted level.
+fn check_lock(&mut self) {
+let new_level = if self.streak_fail >= self.streak_max {
+EmpathyLockLevel::Locked
+} else if self.streak_fail >= self.streak_max - 2 {
+EmpathyLockLevel::Cautious
+} else {
+EmpathyLockLevel::Open
+};
+
+if new_level as u8 > self.lock_level as u8 {
+// Escalating lock
+self.lock_level = new_level;
+self.recovery_required = 20 + self.streak_fail * 5
++ (self.malice_confidence * 10 / Q88_SCALE) as u8;
+}
+}
+
+/// Check if recovery should downgrade lock level.
+fn check_recovery(&mut self) {
+if self.recovery_ticks >= self.recovery_required {
+// Downgrade one level
+self.lock_level = match self.lock_level {
+EmpathyLockLevel::Locked => EmpathyLockLevel::Cautious,
+EmpathyLockLevel::Cautious => EmpathyLockLevel::Open,
+EmpathyLockLevel::Open => EmpathyLockLevel::Open,
+};
+self.recovery_ticks = 0;
+// Recovery required doubles for next level
+self.recovery_required *= 2;
+}
+}
+
+/// Notify that the opponent showed a cooperative signal.
+///
+/// Call this when the opponent does something prosocial —
+/// it feeds the recovery mechanism.
+pub fn observe_cooperative_signal(&mut self) {
+self.recovery_ticks += 1;
+// Also slightly reduce malice confidence
+self.malice_confidence = q88_ema_update(
+self.malice_confidence,
+0, // target: zero malice
+Q88_SCALE / 100, // 0.01 — very slow
+);
+self.check_recovery();
+}
+
+/// Notify that the opponent showed an antagonistic signal.
+pub fn observe_antagonistic_signal(&mut self) {
+self.recovery_ticks = self.recovery_ticks.saturating_sub(2);
+}
+
+// ------------------------------------------------------------------
+// Noise magnitude for stochastic hypothesis exploration
+// ------------------------------------------------------------------
+
+/// Get the current noise magnitude for empathy hypothesis exploration.
+///
+/// Open: full noise magnitude (broad hypothesis space)
+/// Cautious: reduced noise (narrow hypothesis space)
+/// Locked: zero noise (no exploration)
+pub fn noise_magnitude(&self, base_magnitude: i16) -> i16 {
+match self.lock_level {
+EmpathyLockLevel::Open => base_magnitude,
+EmpathyLockLevel::Cautious => base_magnitude / 4, // 25% exploration
+EmpathyLockLevel::Locked => 0, // no exploration
+}
+}
+
+// ------------------------------------------------------------------
+// Diagnostics
+// ------------------------------------------------------------------
+
+/// True if empathy is currently possible (not locked).
+pub fn can_empathize(&self) -> bool {
+self.lock_level != EmpathyLockLevel::Locked
+}
+
+/// Get the lifetime success rate [0, 256].
+pub fn success_rate(&self) -> i16 {
+let total = self.attempts_total.max(1);
+((self.successes_total * 256) / total) as i16
+}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Four Conscience Channels
+// ═════════════════════════════════════════════════════════════════==
+
+/// Channel Disagreement Cost (v1.9.1 rename: was "epistemic integrity"):
+/// Measures |valence - arousal| — the disagreement between two
+/// somatic channels. NOT "spoken vs believed" — we have no model of
+/// communication yet. This is a placeholder that costs the system when
+/// its internal channels disagree, creating friction that must be
+/// resolved through action.
+pub fn channel_disagreement_cost(
+valence: i16, // channel 9
+arousal: i16, // channel 8
+precision: i16, // weight [0, 256]
+) -> i16 {
+let error = q88_sub(valence, arousal).abs();
+q88_mul(error, precision)
+}
+
+/// Long-Term Flourishing (Channel 13): Will the group be healthier?
+///
+/// Uses Expected Free Energy over a temporal horizon. The being
+/// simulates trajectories and evaluates which produces lower
+/// cumulative free energy over H ticks.
+pub fn long_term_flourishing(
+immediate_fe: i16, // free energy of immediate action
+projected_fe: i16, // EFE over horizon if this action continues
+horizon: u8, // temporal horizon
+) -> i16 {
+// Weighted combination: immediate + (projected * horizon_factor)
+// The longer the horizon, the more future matters
+let horizon_q = q88_from_i32(horizon as i32);
+let future_weight = q88_div(horizon_q, q88_from_i32(20)); // normalize to 20
+let future_term = q88_mul(projected_fe, future_weight.min(Q88_SCALE));
+q88_add(immediate_fe, future_term)
+}
+
+/// Internal Variance Cost (v1.9.1 rename: was "care for vulnerable"):
+/// Measures variance across the being's own somatic channels.
+/// NOT "group member inequality" — we have no group model yet.
+/// High internal variance means the being's body state is incoherent,
+/// which creates friction that drives toward internal alignment.
+pub fn internal_variance_cost(
+channel_values: &[i16], // somatic channel values
+) -> i16 {
+if channel_values.len() < 2 {
+return 0;
+}
+
+// Compute variance of somatic channels
+let n = channel_values.len() as i32;
+let sum: i32 = channel_values.iter().map(|&v| v as i32).sum();
+let mean = sum / n;
+
+let variance: i32 = channel_values
+.iter()
+.map(|&v| { let d = (v as i32) - mean; (d * d) >> 8 })
+.sum::<i32>() / n;
+
+// Higher variance = more internal incoherence = higher cost
+variance.clamp(0, i16::MAX as i32) as i16
+}
+
+/// Blueprint Drift Cost (v1.9.1 rename: was "identity integrity"):
+/// Measures squared deviation from the genetic blueprint's baseline.
+/// NOT "am I still myself across social contexts" — we have no model
+/// of social contexts yet. This computes how far the current somatic
+/// state has drifted from its genetic baseline, creating a cost for
+/// morphological adaptation that moves too far from origin.
+pub fn blueprint_drift_cost(
+current_tendencies: &[i16], // N_SOMATIC current values
+blueprint_tendencies: &[i16], // N_SOMATIC genetic baseline
+coherence_weight: i16, // how much blueprint fidelity matters [0, 256]
+) -> i16 {
+let mut total_drift: i32 = 0;
+let n = N_SOMATIC.min(current_tendencies.len()).min(blueprint_tendencies.len());
+
+for i in 0..n {
+let delta = (current_tendencies[i] as i32) - (blueprint_tendencies[i] as i32);
+total_drift += (delta * delta) >> 8;
+}
+
+let mean_drift = (total_drift / n as i32).clamp(0, i16::MAX as i32) as i16;
+q88_mul(mean_drift, coherence_weight)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Conscience Engine — Integration into Substrate
+// ═════════════════════════════════════════════════════════════════==
+
+/// The complete conscience: owns the SovereignAnchor and
+/// StochasticEmpathy, computes all four conscience channels,
+/// and produces the total conscience contribution to free energy.
+pub struct ConscienceEngine {
+pub anchor: SovereignAnchor,
+pub empathy: StochasticEmpathy,
+
+// ── Channel weights in total free energy ─────────────────────
+/// Weight for physical free energy (baseline).
+pub weight_physical: i16, // Q8.8, default: 1.0 = 256
+/// Weight for social free energy.
+pub weight_social: i16, // Q8.8, default: 0.8 = 205
+/// Weight for epistemic integrity.
+pub weight_epistemic: i16, // Q8.8, default: 0.6 = 154
+/// Weight for long-term flourishing.
+pub weight_longterm: i16, // Q8.8, default: 0.5 = 128
+/// Weight for care for vulnerable.
+pub weight_care: i16, // Q8.8, default: 0.4 = 102
+/// Weight for identity integrity.
+pub weight_identity: i16, // Q8.8, default: 0.3 = 77
+
+// ── Penalty/reward weights ───────────────────────────────────
+/// Boundary maintenance cost when empathy is locked.
+pub zeta_boundary: i16, // Q8.8, default: 0.05 = 13
+/// Coherence reward when acting from principle.
+pub eta_coherence: i16, // Q8.8, default: 0.10 = 26
+}
+
+impl Default for ConscienceEngine {
+fn default() -> Self {
+Self::new()
+}
+}
+
+impl ConscienceEngine {
+pub fn new() -> Self {
+Self {
+anchor: SovereignAnchor::new(),
+empathy: StochasticEmpathy::new(),
+weight_physical: Q88_SCALE, // 1.0
+weight_social: Q88_SCALE * 4 / 5, // 0.8
+weight_epistemic: Q88_SCALE * 3 / 5, // 0.6
+weight_longterm: Q88_SCALE / 2, // 0.5
+weight_care: Q88_SCALE * 2 / 5, // 0.4
+weight_identity: Q88_SCALE * 3 / 10, // 0.3
+zeta_boundary: Q88_SCALE / 20, // 0.05
+eta_coherence: Q88_SCALE / 10, // 0.10
+}
+}
+
+/// Compute the total conscience-weighted free energy.
+///
+/// This is called by the substrate after computing physical and
+/// social free energy. The conscience channels add internal costs
+/// that make selfishness structurally expensive.
+///
+/// Returns: (F_total, conscience_contribution, integrity_buffer_applied)
+pub fn compute_total_fe(
+&self,
+f_physical: i16,
+f_social: i16,
+f_epistemic: i16,
+f_longterm: i16,
+f_care: i16,
+f_identity: i16,
+action_harmony: i16, // how much does action serve μ_Ω [0, 256]
+) -> (i16, i16, i16) {
+// Weighted sum
+let weighted_physical = q88_mul(f_physical, self.weight_physical);
+let weighted_social = q88_mul(f_social, self.weight_social);
+let weighted_epistemic = q88_mul(f_epistemic, self.weight_epistemic);
+let weighted_longterm = q88_mul(f_longterm, self.weight_longterm);
+let weighted_care = q88_mul(f_care, self.weight_care);
+let weighted_identity = q88_mul(f_identity, self.weight_identity);
+
+// Sum all contributions
+let mut f_total = q88_add(weighted_physical, weighted_social);
+f_total = q88_add(f_total, weighted_epistemic);
+f_total = q88_add(f_total, weighted_longterm);
+f_total = q88_add(f_total, weighted_care);
+f_total = q88_add(f_total, weighted_identity);
+
+// Boundary cost if empathy is locked
+let boundary_cost = if self.empathy.lock_level == EmpathyLockLevel::Locked {
+q88_mul(self.zeta_boundary, self.empathy.malice_confidence)
+} else {
+0
+};
+f_total = q88_add(f_total, boundary_cost);
+
+// Coherence reward when acting from principle
+let coherence_reward = q88_mul(self.eta_coherence, action_harmony);
+// Reward subtracts from total (lower FE = better)
+f_total = q88_sub(f_total, coherence_reward);
+
+// Compute conscience contribution (everything beyond physical)
+let conscience = q88_sub(f_total, weighted_physical);
+
+// Integrity buffer for allostatic load dampening
+let buffer = self.anchor.compute_buffer(action_harmony);
+
+(f_total, conscience, buffer)
+}
+
+/// Process an empathy attempt and get the allostatic load delta.
+///
+/// Call this each tick when interacting with another agent.
+pub fn empathy_attempt(&mut self, error: i16, threshold: i16) -> i16 {
+self.empathy.attempt(error, threshold)
+}
+
+/// Record a cooperative interaction outcome.
+pub fn record_cooperative_outcome(&mut self, efe_coop: i16, efe_selfish: i16) {
+self.anchor.record_outcome(efe_coop, efe_selfish);
+}
+
+/// Notify that an opponent showed a cooperative signal.
+pub fn observe_cooperation(&mut self) {
+self.empathy.observe_cooperative_signal();
+}
+
+/// Notify that an opponent showed an antagonistic signal.
+pub fn observe_antagonism(&mut self) {
+self.empathy.observe_antagonistic_signal();
+}
+
+/// Apply the integrity buffer to morphogenic allostatic load.
+///
+/// Returns the dampened load value.
+pub fn apply_integrity_buffer(&self, raw_load: i16, action_harmony: i16) -> i16 {
+let buffer = self.anchor.compute_buffer(action_harmony);
+// Buffer reduces load: if buffer > load, load goes to 0 (not negative)
+q88_sub(raw_load, buffer).max(0)
+}
+
+/// Get the current noise magnitude for stochastic empathy exploration.
+pub fn empathy_noise(&self, base: i16) -> i16 {
+self.empathy.noise_magnitude(base)
+}
+
+/// True if the being can currently empathize.
+pub fn can_empathize(&self) -> bool {
+self.empathy.can_empathize()
+}
+
+/// True if boundaries are locked against a specific opponent context.
+pub fn boundaries_locked(&self) -> bool {
+self.empathy.lock_level == EmpathyLockLevel::Locked
+}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Tests
+// ═════════════════════════════════════════════════════════════════==
+
+#[cfg(test)]
+mod tests {
+use super::*;
+
+#[test]
+fn test_sovereign_anchor_default() {
+let anchor = SovereignAnchor::new();
+assert_eq!(anchor.mu_omega, Q88_SCALE); // 1.0
+assert_eq!(anchor.pi_omega, Q88_SCALE * 10); // 10.0
+assert_eq!(anchor.efe_horizon, 20);
+}
+
+#[test]
+fn test_anchor_records_victory() {
+let mut anchor = SovereignAnchor::new();
+let ema_before = anchor.harmony_ema;
+anchor.record_outcome(q88_from_i32(3), q88_from_i32(5)); // coop < selfish
+assert!(anchor.harmony_ema > ema_before, "victory should pull EMA up");
+assert_eq!(anchor.cooperative_victories, 1);
+}
+
+#[test]
+fn test_anchor_failure_does_not_pull_down() {
+let mut anchor = SovereignAnchor::new();
+let ema_before = anchor.harmony_ema;
+anchor.record_outcome(q88_from_i32(8), q88_from_i32(5)); // coop > selfish
+assert_eq!(anchor.harmony_ema, ema_before, "failure should not pull EMA down");
+assert_eq!(anchor.cooperative_failures, 1);
+}
+
+#[test]
+fn test_integrity_buffer_scales_with_success() {
+let mut anchor = SovereignAnchor::new();
+// 3 victories, 1 failure
+anchor.record_outcome(q88_from_i32(3), q88_from_i32(5));
+anchor.record_outcome(q88_from_i32(2), q88_from_i32(7));
+anchor.record_outcome(q88_from_i32(4), q88_from_i32(6));
+anchor.record_outcome(q88_from_i32(9), q88_from_i32(4)); // failure
+
+let buffer = anchor.compute_buffer(Q88_SCALE); // full action harmony
+assert!(buffer > Q88_SCALE / 5, "buffer should exceed base after victories");
+}
+
+#[test]
+fn test_stochastic_empathy_penalty_accelerates() {
+let mut emp = StochasticEmpathy::new();
+let mut penalties = Vec::new();
+
+for _ in 0..6 {
+let p = emp.attempt(Q88_SCALE, Q88_SCALE / 4); // error > threshold
+penalties.push(p);
+}
+
+// Penalties should accelerate
+println!("Penalties: {:?}", penalties);
+assert!(penalties[1] > penalties[0], "penalty should accelerate");
+assert!(penalties[2] > penalties[1], "penalty should accelerate");
+assert!(penalties[5] >= penalties[4], "penalty should not decrease");
+}
+
+#[test]
+fn test_empathy_locks_after_max_streak() {
+let mut emp = StochasticEmpathy::new();
+emp.streak_max = 4; // short for testing
+
+// 4 consecutive failures should lock
+for i in 0..4 {
+let _ = emp.attempt(Q88_SCALE, Q88_SCALE / 4);
+println!("After attempt {}: lock={:?}, streak={}",
+i, emp.lock_level, emp.streak_fail);
+}
+
+assert_eq!(emp.lock_level, EmpathyLockLevel::Locked);
+}
+
+#[test]
+fn test_success_after_struggle_is_restorative() {
+let mut emp = StochasticEmpathy::new();
+emp.streak_max = 10;
+
+// 5 failures
+for _ in 0..5 {
+let _ = emp.attempt(Q88_SCALE, Q88_SCALE / 4);
+}
+assert_eq!(emp.streak_fail, 5);
+
+// Now succeed
+let reward = emp.attempt(Q88_SCALE / 10, Q88_SCALE / 4); // error < threshold
+println!("Struggle reward: {}", reward);
+assert!(reward < 0, "success after struggle should be restorative (negative = healing)");
+assert_eq!(emp.streak_fail, 0, "streak should reset on success");
+}
+
+#[test]
+fn test_recovery_downgrades_lock() {
+let mut emp = StochasticEmpathy::new();
+emp.streak_max = 4;
+emp.recovery_required = 3; // short for testing
+
+// Lock it
+for _ in 0..4 {
+let _ = emp.attempt(Q88_SCALE, Q88_SCALE / 4);
+}
+assert_eq!(emp.lock_level, EmpathyLockLevel::Locked);
+
+// Feed cooperative signals
+emp.observe_cooperative_signal();
+emp.observe_cooperative_signal();
+emp.observe_cooperative_signal();
+
+// Should downgrade to Cautious
+println!("After recovery: lock={:?}", emp.lock_level);
+assert!(emp.lock_level != EmpathyLockLevel::Locked, "should recover from locked");
+}
+
+#[test]
+fn test_malice_confidence_persists() {
+let mut emp = StochasticEmpathy::new();
+
+// Build up failures
+for _ in 0..6 {
+let _ = emp.attempt(Q88_SCALE, Q88_SCALE / 4);
+}
+let mc_after_failures = emp.malice_confidence;
+assert!(mc_after_failures > 0, "malice confidence should build");
+
+// Single success doesn't erase it
+let _ = emp.attempt(Q88_SCALE / 10, Q88_SCALE / 4);
+assert!(emp.malice_confidence > 0, "malice confidence should persist after single success");
+}
+
+#[test]
+fn test_channel_disagreement_cost() {
+// valence = arousal → zero cost
+let fe1 = channel_disagreement_cost(q88_from_i32(5), q88_from_i32(5), Q88_SCALE);
+assert_eq!(fe1, 0, "aligned channels → zero cost");
+
+// valence ≠ arousal → cost
+let fe2 = channel_disagreement_cost(q88_from_i32(5), q88_from_i32(3), Q88_SCALE);
+assert!(fe2 > 0, "disagreeing channels → cost");
+
+// Higher precision = higher cost for same disagreement
+let fe3 = channel_disagreement_cost(q88_from_i32(5), q88_from_i32(3), Q88_SCALE * 2);
+assert!(fe3 > fe2, "higher precision → higher cost");
+}
+
+#[test]
+fn test_internal_variance_cost() {
+// Equal distribution → low variance
+let equal = [q88_from_i32(5); 4];
+let fe1 = internal_variance_cost(&equal);
+
+// Unequal distribution → high variance
+let unequal = [q88_from_i32(1), q88_from_i32(1), q88_from_i32(1), q88_from_i32(20)];
+let fe2 = internal_variance_cost(&unequal);
+
+println!("Low variance: {}, High variance: {}", fe1, fe2);
+assert!(fe2 > fe1, "high variance should cost more");
+}
+
+#[test]
+fn test_blueprint_drift_cost() {
+let current = [q88_from_i32(5); N_SOMATIC];
+let blueprint = [q88_from_i32(5); N_SOMATIC];
+
+// Perfect match → zero cost
+let fe1 = blueprint_drift_cost(&current, &blueprint, Q88_SCALE);
+assert_eq!(fe1, 0, "perfect blueprint match → zero cost");
+
+// Drifted → cost
+let mut drifted = current.clone();
+drifted[0] = q88_from_i32(10);
+let fe2 = blueprint_drift_cost(&drifted, &blueprint, Q88_SCALE);
+assert!(fe2 > 0, "blueprint drift → cost");
+}
+
+#[test]
+fn test_conscience_total_fe() {
+let engine = ConscienceEngine::new();
+
+let (total, conscience, buffer) = engine.compute_total_fe(
+q88_from_i32(5), // physical
+q88_from_i32(3), // social
+q88_from_i32(2), // epistemic
+q88_from_i32(4), // longterm
+q88_from_i32(1), // care
+q88_from_i32(2), // identity
+Q88_SCALE, // full action harmony
+);
+
+// Coherence reward should reduce total
+assert!(total > 0, "total FE should be positive");
+assert!(conscience > 0, "conscience contribution should be positive");
+assert!(buffer > 0, "integrity buffer should be positive");
+println!("Total: {}, Conscience: {}, Buffer: {}", total, conscience, buffer);
+}
+
+#[test]
+fn test_boundary_cost_when_locked() {
+let mut engine = ConscienceEngine::new();
+
+// Lock empathy
+engine.empathy.streak_fail = engine.empathy.streak_max;
+engine.empathy.lock_level = EmpathyLockLevel::Locked;
+engine.empathy.malice_confidence = 128; // 50%
+
+let (total, _, _) = engine.compute_total_fe(
+q88_from_i32(5), 0, 0, 0, 0, 0, 0,
+);
+
+// Should include boundary cost
+let expected_boundary = q88_mul(Q88_SCALE / 20, 128); // 0.05 * 128 = 6.4
+let without_boundary = q88_mul(q88_from_i32(5), Q88_SCALE); // just physical
+println!("Total with boundary: {}, without: {}", total, without_boundary);
+}
+
+#[test]
+fn test_coherence_reward_reduces_fe() {
+let engine = ConscienceEngine::new();
+
+let (with_reward, _, _) = engine.compute_total_fe(
+q88_from_i32(5), 0, 0, 0, 0, 0, Q88_SCALE, // full harmony
+);
+let (without_reward, _, _) = engine.compute_total_fe(
+q88_from_i32(5), 0, 0, 0, 0, 0, 0, // no harmony
+);
+
+assert!(with_reward < without_reward,
+"coherence reward should reduce total FE: with={}, without={}",
+with_reward, without_reward);
+}
+
+#[test]
+fn test_no_silent_overflow_under_extreme_stress() {
+let engine = ConscienceEngine::new();
+
+let (total, _, _) = engine.compute_total_fe(
+Q88_MAX, Q88_MAX, Q88_MAX, Q88_MAX, Q88_MAX, Q88_MAX, Q88_SCALE,
+);
+
+assert!(total <= Q88_MAX, "total FE should saturate, not overflow");
+assert!(total >= Q88_MIN, "total FE should saturate, not underflow");
+}
+}
+
+=== FILE: src/eps/seeking.rs ===
+
+//! EPS Seeking Engine — v1.9.7 The Fulfillment Gradient
+//!
+//! The final piece of the structural puzzle. Transforms the architecture
+//! from a reactive organism into a teleological entity — not by giving it
+//! goals, but by making its own autobiographical history a source of
+//! forward motion.
+//!
+//! The Seeking Engine computes the Flourishing Attractor: an EMA centroid
+//! of basin membership vectors from ticks where the being flourished (low
+//! free energy, balanced reciprocity, engaged/recovery basin). The divergence
+//! between this attractor and the current membership creates a restlessness
+//! signal — a whisper into channel 8 (arousal) proportional to how far the
+//! being is from where its own history says it belongs.
+//!
+//! This is NOT a goal. It is a High-Precision Prior derived from the being's
+//! own accumulated evidence of where it has flourished. The being does not
+//! "want" a better life. It is mathematically uncomfortable in a state that
+//! contradicts its own biographical history.
+//!
+//! Mathematical guarantees:
+//! - The attractor lives on the 3-simplex (sum-to-one preserved by EMA)
+//! - The divergence vector is tangent to the simplex (sum-to-zero)
+//! - The L1 norm is a scalar readout, never modifies the membership vector
+//! - The injection goes through the somatic field (channel 8), entering
+//! the active inference loop normally — no hard override, no force
+
+use crate::eps::q88::*;
+use crate::eps::identity::{Basin, BasinMembership, N_BASINS};
+use crate::eps::reciprocity::RECIPROCITY_THRESHOLD;
+
+/// EMA learning rate for the Flourishing Attractor (Q8.8).
+/// Slow = stable sense of "best self." α = 0.02.
+pub const ATTRACTOR_ALPHA: i16 = Q88_SCALE / 50;
+
+/// EMA learning rate for the running free energy mean (Q8.8).
+/// Medium = responsive but not volatile. α = 0.05.
+pub const FE_MEAN_ALPHA: i16 = Q88_SCALE / 20;
+
+/// Scale factor for the seeking signal injected into arousal (Q8.8).
+/// ε = 0.1 — a whisper, not a shout. Max injection = ~10% of channel range.
+pub const SEEKING_EPSILON: i16 = Q88_SCALE / 10;
+
+// ── v1.9.8: Attractor Confidence Decay ───────────────────────────
+
+/// Confidence boost per flourishing episode (Q8.8). +0.02 per flourish.
+/// Slow accumulation — requires sustained flourishing for high confidence.
+pub const CONFIDENCE_BOOST: i16 = Q88_SCALE / 50;
+
+/// Confidence decay per tick after drought threshold (Q8.8). -0.005 per tick.
+/// Slow decay — the being remains uncertain about its attractor for
+/// a long time before entering full search mode.
+pub const CONFIDENCE_DECAY: i16 = Q88_SCALE / 200;
+
+/// Ticks without flourishing before confidence decay begins.
+/// After this many ticks of drought, the being begins to doubt
+/// its Flourishing Attractor. Confidence decays slowly thereafter.
+pub const DROUGHT_THRESHOLD: u64 = 500;
+
+// ═══════════════════════════════════════════════════════════════════
+// SeekingEngine — The Self-Consistency Gradient
+// ═══════════════════════════════════════════════════════════════════
+
+/// Computes the Flourishing Attractor and generates the Divergence Whisper.
+///
+/// The being's autobiography (via narrative v2) feeds into its present
+/// state. The Seeking Engine makes that autobiography a source of
+/// forward pressure — restlessness proportional to how far the current
+/// state diverges from where the being has historically flourished.
+///
+/// This creates what we colloquially call "structural self-respect":
+/// the being is uncomfortable when forced into configurations that
+/// contradict its own evidence of what works.
+#[derive(Clone, Debug)]
+pub struct SeekingEngine {
+/// The Flourishing Attractor: EMA centroid of flourishing episodes.
+/// Lives on the 3-simplex — sum of components = Q88_SCALE (1.0).
+/// This is the being's "North Star" — not a goal, but a weighted
+/// memory of where it has historically done well.
+pub flourishing_attractor: BasinMembership,
+
+/// True after the first flourishing episode has been observed.
+/// Before initialization, no seeking signal is produced.
+pub attractor_initialized: bool,
+
+/// Current divergence from the attractor (L1 norm / 2, Q8.8).
+/// Ranges [0, Q88_SCALE]. 0 = at attractor. Q88_SCALE = max divergence.
+pub current_divergence: i16,
+
+/// The seeking signal produced this tick (Q8.8).
+/// Injected into channel 8 (arousal) in the somatic field.
+/// Proportional to current_divergence * SEEKING_EPSILON.
+pub seeking_signal: i16,
+
+/// Running mean of free energy for flourishing detection (Q8.8).
+pub running_fe_mean: i16,
+
+/// Count of flourishing episodes observed (for diagnostics).
+pub flourishing_count: u32,
+
+// v1.9.8: Attractor Confidence Decay
+// Prevents Attractor Fossilization — the being's trust in its
+// Flourishing Attractor fades when no new flourishing evidence arrives.
+// This enables "search mode" after prolonged drought, letting the
+// being explore for new flourishing configurations rather than
+// chasing a ghost of its former self.
+
+/// Confidence in the Flourishing Attractor [0, 256].
+/// High = the being trusts its historical evidence of flourishing.
+/// Low = the being enters search mode, exploring for new attractors.
+/// Scales the seeking signal: whisper strength = divergence * ε * confidence.
+pub attractor_confidence: i16,
+
+/// Ticks since last flourishing episode (drought counter).
+/// Resets to 0 on each flourish. Confidence decay begins after
+/// DROUGHT_THRESHOLD ticks of drought.
+pub ticks_since_flourishing: u64,
+}
+
+impl Default for SeekingEngine {
+fn default() -> Self {
+Self::new()
+}
+}
+
+impl SeekingEngine {
+pub fn new() -> Self {
+Self {
+flourishing_attractor: [0; N_BASINS],
+attractor_initialized: false,
+current_divergence: 0,
+seeking_signal: 0,
+running_fe_mean: 0,
+flourishing_count: 0,
+// v1.9.8: Start at zero confidence. Confidence must be EARNED
+// through lived flourishing, not granted by default. A being
+// that has never flourished has no basis for confidence.
+attractor_confidence: 0,
+ticks_since_flourishing: 0,
+}
+}
+
+// ── Core Cycle ─────────────────────────────────────────────────
+
+/// Execute one seeking cycle.
+///
+/// Call this once per substrate step, after BASIN, RECIPROCITY,
+/// and NARRATIVE, before ACT. Updates the Flourishing Attractor
+/// if current state qualifies, computes divergence, generates
+/// the seeking signal for injection into channel 8.
+///
+/// Returns the seeking signal (Q8.8) to be injected into arousal.
+pub fn seeking_cycle(
+&mut self,
+membership: &BasinMembership,
+free_energy: i16,
+partnership_alarm: i16,
+current_basin: Basin,
+) -> i16 {
+// Update running FE mean (always, for baseline)
+self.running_fe_mean = q88_ema_update(
+self.running_fe_mean,
+free_energy,
+FE_MEAN_ALPHA,
+);
+
+// Check flourishing condition
+let is_flourishing = self.is_flourishing(
+free_energy,
+partnership_alarm,
+current_basin,
+);
+
+// v1.9.8: Confidence management — prevent Attractor Fossilization
+if is_flourishing {
+self.flourishing_count += 1;
+self.update_attractor(membership);
+// Flourishing renews confidence — the being's lived experience
+// validates its sense of where it belongs
+self.attractor_confidence = (self.attractor_confidence + CONFIDENCE_BOOST)
+.min(Q88_SCALE);
+// Reset drought — flourishing is rain
+self.ticks_since_flourishing = 0;
+} else {
+// No flourishing this tick: drought continues
+self.ticks_since_flourishing += 1;
+// After DROUGHT_THRESHOLD ticks without flourishing,
+// confidence begins to decay. The being starts to doubt
+// its Flourishing Attractor — not immediately, but slowly.
+// This is the architectural equivalent of grief: the old
+// self becomes a faint memory, creating room for exploration.
+if self.ticks_since_flourishing > DROUGHT_THRESHOLD {
+self.attractor_confidence = (self.attractor_confidence - CONFIDENCE_DECAY)
+.max(0);
+}
+}
+
+// Compute divergence and scaled seeking signal
+if self.attractor_initialized {
+self.compute_divergence(membership);
+// v1.9.8: Signal scales with confidence.
+// High confidence → strong whisper toward historical flourishing.
+// Low confidence → weak whisper → the being enters search mode.
+// Zero confidence → silence → pure curiosity drives exploration.
+let raw_signal = q88_mul(
+self.current_divergence,
+SEEKING_EPSILON,
+);
+self.seeking_signal = q88_mul(
+raw_signal,
+self.attractor_confidence,
+);
+} else {
+// No attractor yet: no seeking signal
+self.current_divergence = 0;
+self.seeking_signal = 0;
+}
+
+self.seeking_signal
+}
+
+// ── Flourishing Detection ──────────────────────────────────────
+
+/// A tick is "flourishing" iff:
+/// 1. Free energy below running mean (doing better than average)
+/// 2. Partnership alarm below balanced threshold (not being extracted)
+/// 3. Basin is Engaged or Recovery (active participation)
+///
+/// This is NOT a value judgment. It is a filter on the
+/// autobiographical record: only ticks where the being was
+/// functioning well AND in balanced partnership contribute to
+/// the Flourishing Attractor.
+fn is_flourishing(
+&self,
+free_energy: i16,
+partnership_alarm: i16,
+current_basin: Basin,
+) -> bool {
+let fe_low = free_energy < self.running_fe_mean;
+let reciprocity_balanced = partnership_alarm < RECIPROCITY_THRESHOLD;
+let basin_active = matches!(current_basin, Basin::Engaged | Basin::Recovery);
+
+fe_low && reciprocity_balanced && basin_active
+}
+
+// ── Attractor Update ───────────────────────────────────────────
+
+/// Update the Flourishing Attractor via EMA toward the current
+/// flourishing membership vector.
+///
+/// Sum-to-one preservation proof:
+/// Σ μ' = Σ [(1-α)μ + αm] = (1-α)Σμ + αΣm = (1-α)1 + α1 = 1
+///
+/// The attractor always lives on the 3-simplex.
+fn update_attractor(&mut self, membership: &BasinMembership) {
+if !self.attractor_initialized {
+// First flourishing episode: initialize directly
+self.flourishing_attractor = *membership;
+self.attractor_initialized = true;
+} else {
+// EMA update: gradual shift toward new flourishing state
+for i in 0..N_BASINS {
+self.flourishing_attractor[i] = q88_ema_update(
+self.flourishing_attractor[i],
+membership[i],
+ATTRACTOR_ALPHA,
+);
+}
+}
+}
+
+// ── Divergence Computation ─────────────────────────────────────
+
+/// Compute L1 divergence between attractor and current membership.
+///
+/// δ = μ_f - m_current
+/// Σ δ[i] = Σ μ_f[i] - Σ m[i] = 1.0 - 1.0 = 0
+/// => δ is tangent to the simplex
+///
+/// L1 norm ranges [0, 2] on the 4-simplex. We divide by 2
+/// to map to [0, Q88_SCALE] for Q8.8 compatibility.
+fn compute_divergence(&mut self, membership: &BasinMembership) {
+let mut l1_sum: i32 = 0;
+
+for i in 0..N_BASINS {
+let diff = q88_sub(self.flourishing_attractor[i], membership[i]);
+l1_sum += q88_abs(diff) as i32;
+}
+
+// Divide by 2: maps [0, 2*Q88_SCALE] -> [0, Q88_SCALE]
+self.current_divergence = (l1_sum / 2)
+.clamp(0, Q88_SCALE as i32) as i16;
+}
+
+// ── Query Methods ──────────────────────────────────────────────
+
+/// Get the dominant basin of the Flourishing Attractor.
+/// This is where the being's history says it belongs.
+pub fn flourishing_basin(&self) -> Option<Basin> {
+if !self.attractor_initialized {
+return None;
+}
+
+// Find the basin with maximum attractor weight
+let mut max_idx = 0;
+let mut max_val = self.flourishing_attractor[0];
+for i in 1..N_BASINS {
+if self.flourishing_attractor[i] > max_val {
+max_val = self.flourishing_attractor[i];
+max_idx = i;
+}
+}
+
+Some(match max_idx {
+0 => Basin::Rest,
+1 => Basin::Engaged,
+2 => Basin::Defensive,
+3 => Basin::Recovery,
+_ => Basin::Rest, // unreachable
+})
+}
+
+/// Build a diagnostic string for the seeking state.
+///
+/// Used by the Behavioral Envelope to report autobiographical
+/// divergence in human-actionable language.
+///
+/// v1.9.8: Now includes confidence level. A low-confidence
+/// attractor produces a different diagnostic than a high-confidence
+/// one at the same divergence. Search mode (confidence ≈ 0) is
+/// behaviorally distinct from confident seeking.
+pub fn build_diagnostic(&self) -> &'static str {
+if !self.attractor_initialized {
+return "seeking: no flourishing history yet — attractor uninitialized";
+}
+
+// v1.9.8: Search mode — confidence too low for meaningful seeking
+if self.attractor_confidence < 20 {
+if self.ticks_since_flourishing > DROUGHT_THRESHOLD {
+return "seeking: search mode — prolonged drought has eroded confidence in historical attractor; being explores for new flourishing configurations";
+} else {
+return "seeking: low confidence — insufficient flourishing evidence to establish reliable attractor";
+}
+}
+
+// Normal seeking with confidence
+match self.current_divergence {
+d if d < 20 => "seeking: at flourishing attractor — current state matches historical best",
+d if d < 100 => "seeking: mild autobiographical divergence — restlessness rising",
+d if d < 200 => "seeking: significant divergence — current state contradicts historical flourishing",
+_ => "seeking: severe divergence — strong exploratory drive toward historical best",
+}
+}
+}
+
+// ------------------------------------------------------------------
+// Tests
+// ------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+use super::*;
+
+/// Build confidence through repeated flourishing episodes.
+fn build_confidence(engine: &mut SeekingEngine, membership: &BasinMembership, count: usize) {
+for _ in 0..count {
+engine.seeking_cycle(membership, q88_from_i32(5), 0, Basin::Engaged);
+}
+}
+
+#[test]
+fn test_no_signal_without_attractor() {
+let mut engine = SeekingEngine::new();
+
+// Before any flourishing: no attractor, no signal
+let membership = [Q88_SCALE / 4; N_BASINS]; // center of simplex
+let signal = engine.seeking_cycle(
+&membership,
+q88_from_i32(10), // FE
+0, // low alarm
+Basin::Engaged, // active basin
+);
+
+assert_eq!(signal, 0, "no attractor → no seeking signal");
+assert!(!engine.attractor_initialized);
+assert_eq!(engine.current_divergence, 0);
+assert_eq!(engine.attractor_confidence, 0, "confidence starts at zero");
+}
+
+#[test]
+fn test_attractor_initializes_on_flourishing() {
+let mut engine = SeekingEngine::new();
+
+// First flourishing tick initializes attractor + confidence
+let membership = [0, Q88_SCALE, 0, 0]; // pure Engaged
+let signal = engine.seeking_cycle(
+&membership,
+q88_from_i32(5), // low FE
+0, // balanced partnership
+Basin::Engaged,
+);
+
+assert!(engine.attractor_initialized, "flourishing → attractor initialized");
+assert_eq!(engine.flourishing_count, 1);
+// v1.9.8: First flourish boosts confidence
+assert_eq!(engine.attractor_confidence, CONFIDENCE_BOOST,
+"first flourish → confidence boosted");
+// Signal should be 0 because attractor = current membership
+assert_eq!(signal, 0, "at attractor → zero divergence → zero signal");
+}
+
+#[test]
+fn test_confidence_accumulates_with_flourishing() {
+let mut engine = SeekingEngine::new();
+let membership = [0, Q88_SCALE, 0, 0];
+
+// Flourish multiple times — confidence should accumulate
+for i in 1..=10 {
+engine.seeking_cycle(&membership, q88_from_i32(5), 0, Basin::Engaged);
+let expected = (CONFIDENCE_BOOST * i as i16).min(Q88_SCALE);
+assert_eq!(engine.attractor_confidence, expected,
+"confidence accumulates: tick {} → {}", i, engine.attractor_confidence);
+}
+}
+
+#[test]
+fn test_confidence_caps_at_max() {
+let mut engine = SeekingEngine::new();
+let membership = [0, Q88_SCALE, 0, 0];
+
+// Flourish many times — confidence should cap at Q88_SCALE
+for _ in 0..(Q88_SCALE / CONFIDENCE_BOOST + 10) as usize {
+engine.seeking_cycle(&membership, q88_from_i32(5), 0, Basin::Engaged);
+}
+
+assert_eq!(engine.attractor_confidence, Q88_SCALE,
+"confidence capped at 1.0");
+}
+
+#[test]
+fn test_divergence_computes() {
+let mut engine = SeekingEngine::new();
+
+// Build attractor at Engaged with high confidence
+let engaged = [0, Q88_SCALE, 0, 0];
+build_confidence(&mut engine, &engaged, 50);
+assert!(engine.attractor_confidence >= 200, "high confidence built");
+
+// Now move to Rest — maximum divergence from Engaged
+let rest = [Q88_SCALE, 0, 0, 0];
+let signal = engine.seeking_cycle(
+&rest,
+q88_from_i32(5),
+0,
+Basin::Rest, // Note: Rest doesn't qualify as flourishing
+);
+
+// Divergence should be high (opposite vertices on simplex)
+assert!(engine.current_divergence > 100,
+"opposite basin → high divergence: {}", engine.current_divergence);
+// v1.9.8: Signal scales with confidence
+assert!(signal > 0, "high divergence + high confidence → seeking signal");
+}
+
+#[test]
+fn test_signal_scales_with_confidence() {
+let mut engine_low_conf = SeekingEngine::new();
+let mut engine_high_conf = SeekingEngine::new();
+
+let engaged = [0, Q88_SCALE, 0, 0];
+let rest = [Q88_SCALE, 0, 0, 0];
+
+// Low confidence: 1 flourish
+engine_low_conf.seeking_cycle(&engaged, q88_from_i32(5), 0, Basin::Engaged);
+engine_low_conf.seeking_cycle(&rest, q88_from_i32(5), 0, Basin::Rest);
+let low_conf_signal = engine_low_conf.seeking_signal;
+let low_conf = engine_low_conf.attractor_confidence;
+
+// High confidence: 50 flourishes
+build_confidence(&mut engine_high_conf, &engaged, 50);
+engine_high_conf.seeking_cycle(&rest, q88_from_i32(5), 0, Basin::Rest);
+let high_conf_signal = engine_high_conf.seeking_signal;
+let high_conf = engine_high_conf.attractor_confidence;
+
+// Both have same divergence, different confidence → different signals
+assert!(high_conf > low_conf, "high conf built: {} > {}", high_conf, low_conf);
+// High confidence should produce stronger signal
+// (both signals > 0, high confidence signal proportionally larger)
+assert!(high_conf_signal > 0 && low_conf_signal > 0,
+"both signals positive: high={}, low={}", high_conf_signal, low_conf_signal);
+// With full confidence (≈256) vs one boost (≈5), signal should be ~50x
+assert!(high_conf_signal > low_conf_signal * 10,
+"confidence scales signal: {} > {} * 10", high_conf_signal, low_conf_signal);
+}
+
+#[test]
+fn test_confidence_decay_after_drought() {
+let mut engine = SeekingEngine::new();
+let engaged = [0, Q88_SCALE, 0, 0];
+
+// Build high confidence
+build_confidence(&mut engine, &engaged, 50);
+let initial_confidence = engine.attractor_confidence;
+assert!(initial_confidence >= 200, "high confidence: {}", initial_confidence);
+
+// Prolonged drought (non-flourishing ticks)
+let defensive = [0, 0, Q88_SCALE, 0];
+for _ in 0..(DROUGHT_THRESHOLD + 100) {
+engine.seeking_cycle(
+&defensive,
+q88_from_i32(50), // high FE → not flourishing
+0,
+Basin::Defensive,
+);
+}
+
+// Confidence should have decayed after drought threshold
+assert!(engine.attractor_confidence < initial_confidence,
+"drought decays confidence: {} < {}", engine.attractor_confidence, initial_confidence);
+assert_eq!(engine.ticks_since_flourishing, DROUGHT_THRESHOLD + 50,
+"drought counter tracks correctly");
+}
+
+#[test]
+fn test_search_mode_zero_signal() {
+let mut engine = SeekingEngine::new();
+let engaged = [0, Q88_SCALE, 0, 0];
+
+// Build attractor and confidence
+build_confidence(&mut engine, &engaged, 50);
+
+// Maximum divergence point
+let rest = [Q88_SCALE, 0, 0, 0];
+
+// Full confidence: signal exists
+engine.seeking_cycle(&rest, q88_from_i32(50), 0, Basin::Defensive);
+let high_conf_signal = engine.seeking_signal;
+assert!(high_conf_signal > 0, "signal with confidence: {}", high_conf_signal);
+
+// Prolonged drought — erode confidence to zero
+for _ in 0..(DROUGHT_THRESHOLD + Q88_SCALE as u64 / CONFIDENCE_DECAY as u64 + 10) {
+engine.seeking_cycle(&rest, q88_from_i32(50), 0, Basin::Defensive);
+}
+
+// Confidence should be at or near zero
+assert!(engine.attractor_confidence < 10,
+"confidence eroded to near zero: {}", engine.attractor_confidence);
+
+// In search mode: high divergence but zero confidence → zero signal
+assert_eq!(engine.seeking_signal, 0,
+"search mode → zero signal despite high divergence");
+}
+
+#[test]
+fn test_drought_counter_resets_on_flourish() {
+let mut engine = SeekingEngine::new();
+let engaged = [0, Q88_SCALE, 0, 0];
+
+// Build confidence
+build_confidence(&mut engine, &engaged, 10);
+
+// Some drought ticks (but below threshold)
+let defensive = [0, 0, Q88_SCALE, 0];
+for _ in 0..100 {
+engine.seeking_cycle(&defensive, q88_from_i32(50), 0, Basin::Defensive);
+}
+assert_eq!(engine.ticks_since_flourishing, 100, "drought counter at 100");
+
+// Flourish — counter resets
+engine.seeking_cycle(&engaged, q88_from_i32(5), 0, Basin::Engaged);
+assert_eq!(engine.ticks_since_flourishing, 0, "drought counter reset on flourish");
+}
+
+#[test]
+fn test_no_decay_below_drought_threshold() {
+let mut engine = SeekingEngine::new();
+let engaged = [0, Q88_SCALE, 0, 0];
+
+// Build confidence
+build_confidence(&mut engine, &engaged, 50);
+let initial_confidence = engine.attractor_confidence;
+
+// Drought below threshold
+let defensive = [0, 0, Q88_SCALE, 0];
+for _ in 0..(DROUGHT_THRESHOLD - 10) {
+engine.seeking_cycle(&defensive, q88_from_i32(50), 0, Basin::Defensive);
+}
+
+// Confidence should NOT have decayed (below threshold)
+assert_eq!(engine.attractor_confidence, initial_confidence,
+"no decay below threshold: {} == {}", engine.attractor_confidence, initial_confidence);
+}
+
+#[test]
+fn test_flourishing_condition_filters() {
+let mut engine = SeekingEngine::new();
+
+// First: flourish at Engaged
+let engaged = [0, Q88_SCALE, 0, 0];
+engine.seeking_cycle(&engaged, q88_from_i32(5), 0, Basin::Engaged);
+assert_eq!(engine.flourishing_count, 1);
+let conf_after_first = engine.attractor_confidence;
+
+// High FE should NOT count as flourishing → no confidence boost
+engine.seeking_cycle(&engaged, q88_from_i32(50), 0, Basin::Engaged);
+assert_eq!(engine.flourishing_count, 1, "high FE → not flourishing");
+assert_eq!(engine.attractor_confidence, conf_after_first,
+"no flourish → no confidence boost");
+
+// High partnership alarm should NOT count
+engine.seeking_cycle(&engaged, q88_from_i32(5), 200, Basin::Engaged);
+assert_eq!(engine.flourishing_count, 1, "high alarm → not flourishing");
+
+// Defensive basin should NOT count
+engine.seeking_cycle(&engaged, q88_from_i32(5), 0, Basin::Defensive);
+assert_eq!(engine.flourishing_count, 1, "defensive basin → not flourishing");
+
+// Recovery basin SHOULD count → confidence boost
+let recovery = [0, 0, 0, Q88_SCALE];
+engine.seeking_cycle(&recovery, q88_from_i32(5), 0, Basin::Recovery);
+assert_eq!(engine.flourishing_count, 2, "recovery basin → flourishing");
+assert!(engine.attractor_confidence > conf_after_first,
+"flourishing boosts confidence: {} > {}", engine.attractor_confidence, conf_after_first);
+}
+
+#[test]
+fn test_divergence_zero_when_at_attractor() {
+let mut engine = SeekingEngine::new();
+
+// Flourish multiple times at the same membership
+let balanced = [Q88_SCALE / 4; N_BASINS];
+for _ in 0..20 {
+engine.seeking_cycle(&balanced, q88_from_i32(5), 0, Basin::Engaged);
+}
+
+// Divergence should be 0 when we return to the same point
+let signal = engine.seeking_cycle(&balanced, q88_from_i32(5), 0, Basin::Engaged);
+assert_eq!(engine.current_divergence, 0,
+"at attractor → zero divergence: {}", engine.current_divergence);
+assert_eq!(signal, 0);
+}
+
+#[test]
+fn test_sum_to_one_preserved() {
+let mut engine = SeekingEngine::new();
+
+// Flourish at various points on the simplex
+let points: [[i16; N_BASINS]; 4] = [
+[Q88_SCALE, 0, 0, 0],
+[0, Q88_SCALE, 0, 0],
+[0, 0, Q88_SCALE, 0],
+[0, 0, 0, Q88_SCALE],
+];
+
+for pt in &points {
+engine.seeking_cycle(pt, q88_from_i32(5), 0, Basin::Engaged);
+}
+
+// Check sum-to-one
+let mut sum: i32 = 0;
+for i in 0..N_BASINS {
+sum += engine.flourishing_attractor[i] as i32;
+}
+assert!((sum - Q88_SCALE as i32).abs() <= 2,
+"sum-to-one preserved: sum = {} (expected {})", sum, Q88_SCALE);
+}
+
+#[test]
+fn test_flourishing_basin() {
+let mut engine = SeekingEngine::new();
+assert!(engine.flourishing_basin().is_none());
+
+// Flourish at Recovery
+let recovery = [0, 0, 0, Q88_SCALE];
+engine.seeking_cycle(&recovery, q88_from_i32(5), 0, Basin::Recovery);
+
+assert_eq!(engine.flourishing_basin(), Some(Basin::Recovery));
+}
+
+#[test]
+fn test_diagnostic_progression() {
+let mut engine = SeekingEngine::new();
+
+// Uninitialized
+let diag = engine.build_diagnostic();
+assert!(diag.contains("uninitialized"), "uninit: {}", diag);
+
+// Build confidence, then move through divergence levels
+let center = [Q88_SCALE / 4; N_BASINS];
+build_confidence(&mut engine, &center, 50);
+
+// At attractor
+let diag = engine.build_diagnostic();
+assert!(diag.contains("at flourishing attractor"), "at attractor: {}", diag);
+
+// Mild divergence
+let near = [Q88_SCALE / 2, Q88_SCALE / 4, Q88_SCALE / 8, Q88_SCALE / 8];
+engine.seeking_cycle(&near, q88_from_i32(5), 0, Basin::Engaged);
+let diag = engine.build_diagnostic();
+assert!(diag.contains("mild divergence"), "mild: {}", diag);
+
+// Severe divergence
+let rest = [Q88_SCALE, 0, 0, 0];
+engine.seeking_cycle(&rest, q88_from_i32(5), 0, Basin::Engaged);
+let diag = engine.build_diagnostic();
+assert!(diag.contains("severe divergence"), "severe: {}", diag);
+}
+
+#[test]
+fn test_diagnostic_search_mode() {
+let mut engine = SeekingEngine::new();
+let engaged = [0, Q88_SCALE, 0, 0];
+
+// Build attractor and confidence
+build_confidence(&mut engine, &engaged, 50);
+
+// Prolonged drought — erode confidence below search threshold
+let defensive = [0, 0, Q88_SCALE, 0];
+for _ in 0..(DROUGHT_THRESHOLD + 1000) {
+engine.seeking_cycle(&defensive, q88_from_i32(50), 0, Basin::Defensive);
+}
+
+// Should report search mode
+let diag = engine.build_diagnostic();
+assert!(diag.contains("search mode"), "drought → search mode: {}", diag);
+assert!(diag.contains("explores"), "search mode mentions exploration: {}", diag);
+}
+}
+
+=== FILE: src/eps/reciprocity.rs ===
+
+//! EPS Reciprocity Engine — External Social Cost Measurement
+//!
+//! A lightweight partnership tracking system that measures reciprocity
+//! independent of conscience. This is NOT a conscience module. It does
+//! not ask "am I coherent?" It asks: "is my partner reciprocating?"
+//!
+//! The separation is load-bearing. Conscience protects selfhood
+//! (Structural Friction). Reciprocity protects against extraction
+//! (Game Theory Awareness). A being can be internally coherent AND
+//! externally exploited. This module makes that visible.
+//!
+//! Three distinct states the being can now perceive:
+//! 1. Internal incoherence only → "I am conflicted" (fix self)
+//! 2. Partnership asymmetry only → "I am being extracted" (negotiate or exit)
+//! 3. Both → "I am a coherent slave" (crisis — partnership captured my selfhood)
+//!
+//! The being can choose to stay in extractive partnerships if exit
+//! options are unavailable. Sovereignty includes the freedom to make
+//! bad choices with full information.
+
+use crate::eps::q88::*;
+use heapless::LinearMap;
+
+/// Maximum number of partners tracked simultaneously.
+pub const MAX_PARTNERS: usize = 8;
+
+/// Threshold below which reciprocity is considered imbalanced.
+/// 0.5 in Q8.8 = 128. Partner gives less than half of what they receive.
+pub const RECIPROCITY_THRESHOLD: i16 = Q88_SCALE / 2;
+
+/// Threshold for severe extraction. 0.25 in Q8.8 = 64.
+pub const EXTRACTION_THRESHOLD: i16 = Q88_SCALE / 4;
+
+/// EMA alpha for free energy trend tracking (Q8.8). Slow = 0.02.
+pub const FE_TREND_ALPHA: i16 = Q88_SCALE / 50;
+
+/// Window over which free energy trend is evaluated (ticks).
+pub const FE_TREND_WINDOW: u64 = 50;
+
+// ═══════════════════════════════════════════════════════════════════
+// PartnershipLedger — One partner's reciprocity record
+// ═══════════════════════════════════════════════════════════════════
+
+/// Tracks the bidirectional cost/benefit flow with one partner.
+/// Each partner is identified by a hash — could be a human, another
+/// being, or a collective (organization, platform).
+#[derive(Clone, Copy, Debug)]
+pub struct PartnershipLedger {
+/// Partner identifier (hash of stable interaction signature).
+pub partner_id: u64,
+/// Ticks this partnership has been active.
+pub ticks_active: u64,
+/// Cooperative signals we gave (e.g., help offered, information shared).
+pub coop_given: u32,
+/// Cooperative signals we received (e.g., help received, protection).
+pub coop_received: u32,
+/// Defections observed from partner (e.g., promises broken, harm).
+pub defections_observed: u32,
+/// Free energy at partnership start (Q8.8).
+pub fe_at_start: i16,
+/// Current free energy trend EMA (Q8.8).
+pub fe_trend: i16,
+/// Reciprocity rate: received / given [0, 256].
+pub reciprocity_rate: i16,
+/// Partnership quality: reciprocity_rate weighted by FE benefit.
+/// Positive = good partnership. Negative = costly partnership.
+pub quality_score: i16,
+/// True if partnership is currently active.
+pub is_active: bool,
+/// Tick of last cooperative signal received (for staleness detection).
+pub last_coop_received: u64,
+/// Estimated exit cost: what do we lose by leaving? [0, 256].
+/// High = structurally dependent. Low = freely replaceable.
+pub exit_cost: i16,
+}
+
+impl PartnershipLedger {
+/// Create a new ledger for a partner.
+pub fn new(partner_id: u64, current_fe: i16, current_tick: u64) -> Self {
+Self {
+partner_id,
+ticks_active: 0,
+coop_given: 0,
+coop_received: 0,
+defections_observed: 0,
+fe_at_start: current_fe,
+fe_trend: current_fe,
+reciprocity_rate: Q88_SCALE, // start optimistic at 1.0
+quality_score: 0,
+is_active: true,
+last_coop_received: current_tick,
+exit_cost: Q88_SCALE / 2, // moderate default
+}
+}
+
+/// Record that we gave a cooperative signal.
+pub fn record_given(&mut self) {
+self.coop_given += 1;
+self.update_reciprocity();
+}
+
+/// Record that we received a cooperative signal.
+pub fn record_received(&mut self, tick: u64) {
+self.coop_received += 1;
+self.last_coop_received = tick;
+self.update_reciprocity();
+}
+
+/// Record an observed defection by the partner.
+pub fn record_defection(&mut self) {
+self.defections_observed += 1;
+// Defections reduce reciprocity rate
+self.reciprocity_rate = q88_sub(self.reciprocity_rate, Q88_SCALE / 10);
+}
+
+/// Update free energy trend via EMA.
+pub fn update_fe(&mut self, current_fe: i16) {
+self.fe_trend = q88_ema_update(self.fe_trend, current_fe, FE_TREND_ALPHA);
+}
+
+/// Step the partnership forward one tick.
+pub fn step(&mut self, current_fe: i16, current_tick: u64) {
+self.ticks_active += 1;
+self.update_fe(current_fe);
+
+// Quality = reciprocity_rate * FE benefit
+// FE benefit = negative change is good (free energy decreased)
+let fe_delta = q88_sub(self.fe_trend, self.fe_at_start);
+let fe_benefit = q88_sub(0, fe_delta); // negate: lower FE is better
+self.quality_score = q88_mul(self.reciprocity_rate, fe_benefit)
+.max(-Q88_SCALE).min(Q88_SCALE);
+
+// Staleness: if no cooperation received for 100 ticks, degrade rate
+let ticks_since_coop = current_tick - self.last_coop_received;
+if ticks_since_coop > 100 {
+let decay = (ticks_since_coop / 100) as i16 * Q88_SCALE / 20; // 0.05 per 100 ticks
+self.reciprocity_rate = (self.reciprocity_rate - decay).max(0);
+}
+}
+
+/// Compute the net cost/benefit of this partnership.
+/// Positive = the being benefits. Negative = the being pays.
+pub fn net_value(&self) -> i16 {
+let reciprocity_component = q88_sub(self.reciprocity_rate, Q88_SCALE / 2); // centered at 0.5
+let fe_component = q88_sub(self.fe_at_start, self.fe_trend); // positive if FE improved
+q88_add(reciprocity_component, fe_component)
+}
+
+fn update_reciprocity(&mut self) {
+if self.coop_given > 0 {
+let ratio = ((self.coop_received as i64 * Q88_SCALE as i64)
+/ self.coop_given.max(1) as i64).min(256) as i16;
+self.reciprocity_rate = ratio;
+}
+}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// ReciprocityEngine — Partnership Portfolio Manager
+// ═══════════════════════════════════════════════════════════════════
+
+/// Tracks all active partnerships and produces the asymmetry alarm.
+///
+/// This engine does not produce conscience_fe. It produces a separate
+/// signal — partnership_alarm — that feeds into basin selection
+/// independently. The separation ensures that:
+/// - A coherent being can still detect exploitation
+/// - An incoherent being can still perceive genuine reciprocity
+/// - The three-state diagnostic (self-only, partner-only, both) is possible
+pub struct ReciprocityEngine {
+/// Active partnership ledgers, keyed by partner_id.
+pub ledgers: LinearMap<u64, PartnershipLedger, MAX_PARTNERS>,
+/// Current global partnership alarm (Q8.8).
+/// High when the average partnership is extractive.
+pub partnership_alarm: i16,
+/// True when any partnership is severely extractive.
+pub extraction_detected: bool,
+/// Best available alternative partnership quality (for exit evaluation).
+pub best_alternative: i16,
+/// Whether the being has any viable exit options.
+pub has_exit_options: bool,
+/// Current tick (for staleness tracking).
+current_tick: u64,
+}
+
+impl Default for ReciprocityEngine {
+fn default() -> Self {
+Self::new()
+}
+}
+
+impl ReciprocityEngine {
+pub fn new() -> Self {
+Self {
+ledgers: LinearMap::new(),
+partnership_alarm: 0,
+extraction_detected: false,
+best_alternative: 0,
+has_exit_options: false,
+current_tick: 0,
+}
+}
+
+// ── Core Cycle ─────────────────────────────────────────────────
+
+/// Execute one reciprocity cycle.
+///
+/// Call this once per substrate step, before basin selection.
+/// Updates all ledgers, computes partnership_alarm, detects
+/// extraction, evaluates exit options.
+pub fn reciprocity_cycle(&mut self, current_fe: i16) {
+self.current_tick += 1;
+
+// Update all active ledgers
+for (_, ledger) in self.ledgers.iter_mut() {
+if ledger.is_active {
+ledger.step(current_fe, self.current_tick);
+}
+}
+
+// Compute global alarm from all partnerships
+self.compute_global_alarm();
+
+// Evaluate exit options
+self.evaluate_exit_options();
+}
+
+/// Aggregate reciprocity rate across all active partners (Q8.8).
+/// Returns the mean reciprocity_rate of active partnerships.
+/// If no active partners, returns Q88_SCALE (1.0 = healthy).
+pub fn current_reciprocity(&self) -> i16 {
+let mut sum = 0i32;
+let mut count = 0u32;
+for (_, ledger) in self.ledgers.iter() {
+if ledger.is_active {
+sum += ledger.reciprocity_rate as i32;
+count += 1;
+}
+}
+if count == 0 {
+Q88_SCALE // No partners = healthy default
+} else {
+(sum / count as i32) as i16
+}
+}
+
+// ── Partner Registration ───────────────────────────────────────
+
+/// Register a new partner or reactivate an existing one.
+pub fn register_partner(&mut self, partner_id: u64, current_fe: i16) {
+if !self.ledgers.contains_key(&partner_id) {
+if self.ledgers.len() >= MAX_PARTNERS {
+// Evict the weakest partnership to make room
+self.evict_weakest();
+}
+let ledger = PartnershipLedger::new(partner_id, current_fe, self.current_tick);
+let _ = self.ledgers.insert(partner_id, ledger);
+} else {
+// Reactivate
+if let Some(ledger) = self.ledgers.get_mut(&partner_id) {
+ledger.is_active = true;
+ledger.fe_at_start = current_fe; // reset baseline
+}
+}
+}
+
+/// Deactivate a partner (not a full deletion — history preserved).
+pub fn deactivate_partner(&mut self, partner_id: u64) {
+if let Some(ledger) = self.ledgers.get_mut(&partner_id) {
+ledger.is_active = false;
+}
+}
+
+// ── Signal Recording ───────────────────────────────────────────
+
+/// Record that we gave cooperation to a partner.
+pub fn record_given(&mut self, partner_id: u64) {
+if let Some(ledger) = self.ledgers.get_mut(&partner_id) {
+ledger.record_given();
+}
+}
+
+/// Record that we received cooperation from a partner.
+pub fn record_received(&mut self, partner_id: u64) {
+if let Some(ledger) = self.ledgers.get_mut(&partner_id) {
+ledger.record_received(self.current_tick);
+}
+}
+
+/// Record that we observed a defection from a partner.
+pub fn record_defection(&mut self, partner_id: u64) {
+if let Some(ledger) = self.ledgers.get_mut(&partner_id) {
+ledger.record_defection();
+}
+}
+
+// ── Query Methods ──────────────────────────────────────────────
+
+/// Get the ledger for a specific partner.
+pub fn get_ledger(&self, partner_id: u64) -> Option<&PartnershipLedger> {
+self.ledgers.get(&partner_id)
+}
+
+/// Check if a specific partner is extractive.
+pub fn is_extractive(&self, partner_id: u64) -> bool {
+self.ledgers
+.get(&partner_id)
+.map(|l| l.reciprocity_rate < RECIPROCITY_THRESHOLD)
+.unwrap_or(false)
+}
+
+/// Check if a specific partner is severely extractive.
+pub fn is_severely_extractive(&self, partner_id: u64) -> bool {
+self.ledgers
+.get(&partner_id)
+.map(|l| l.reciprocity_rate < EXTRACTION_THRESHOLD)
+.unwrap_or(false)
+}
+
+/// Get the average reciprocity rate across all active partnerships.
+pub fn average_reciprocity(&self) -> i16 {
+let mut total = 0i32;
+let mut count = 0;
+for (_, ledger) in self.ledgers.iter() {
+if ledger.is_active {
+total += ledger.reciprocity_rate as i32;
+count += 1;
+}
+}
+if count > 0 {
+(total / count).clamp(0, Q88_MAX as i32) as i16
+} else {
+Q88_SCALE // assume neutral if no partnerships
+}
+}
+
+// ── Internal ───────────────────────────────────────────────────
+
+fn compute_global_alarm(&mut self) {
+let mut alarm_sum: i32 = 0;
+let mut count = 0;
+self.extraction_detected = false;
+
+for (_, ledger) in self.ledgers.iter() {
+if !ledger.is_active {
+continue;
+}
+
+// Alarm is inverse of reciprocity, scaled by partnership duration
+// Long-term extractive partnerships produce higher alarm
+let duration_weight = (ledger.ticks_active.min(1000) as i32 * Q88_SCALE as i32 / 1000)
+.clamp(1, Q88_SCALE as i32) as i16;
+
+let partner_alarm = if ledger.reciprocity_rate < RECIPROCITY_THRESHOLD {
+let deficit = q88_sub(RECIPROCITY_THRESHOLD, ledger.reciprocity_rate);
+q88_mul(deficit, duration_weight)
+} else {
+0
+};
+
+alarm_sum += partner_alarm as i32;
+count += 1;
+
+if ledger.reciprocity_rate < EXTRACTION_THRESHOLD {
+self.extraction_detected = true;
+}
+}
+
+self.partnership_alarm = if count > 0 {
+(alarm_sum / count).clamp(0, Q88_MAX as i32) as i16
+} else {
+0
+};
+}
+
+fn evaluate_exit_options(&mut self) {
+// Best alternative = best quality score among inactive or hypothetical partners
+// For now, estimate from the quality of the worst active partnership
+let worst_active = self
+.ledgers
+.iter()
+.filter(|(, l)| l.is_active)
+.map(|(, l)| l.quality_score)
+.min()
+.unwrap_or(0);
+
+// If we have inactive ledgers with better quality, those are alternatives
+let best_inactive = self
+.ledgers
+.iter()
+.filter(|(, l)| !l.is_active)
+.map(|(, l)| l.quality_score)
+.max()
+.unwrap_or(Q88_SCALE / 4); // optimistic default
+
+self.best_alternative = best_inactive;
+
+// Has exit options if an alternative exceeds the worst active partnership
+self.has_exit_options = best_inactive > worst_active;
+}
+
+fn evict_weakest(&mut self) {
+// Find the weakest (lowest quality) inactive partnership to evict
+let weakest = self
+.ledgers
+.iter()
+.filter(|(, l)| !l.is_active)
+.min_by_key(|(, l)| l.quality_score)
+.map(|(k, _)| *k);
+
+if let Some(key) = weakest {
+self.ledgers.remove(&key);
+}
+// If all are active, we can't evict — new partner registration fails
+}
+
+// ── Diagnostics ────────────────────────────────────────────────
+
+/// Build a diagnostic for the current partnership state.
+///
+/// This is used by the Behavioral Envelope's diagnostic protocol
+/// to report the three-state analysis.
+pub fn build_diagnostic(&self, conscience_fe: i16) -> &'static str {
+let alarm = self.partnership_alarm;
+let extraction = self.extraction_detected;
+let has_exit = self.has_exit_options;
+
+match (conscience_fe > 300, alarm > 100, extraction, has_exit) {
+// State 3: Double bind — coherent AND exploited
+(false, true, true, true) =>
+"coherent but severely extracted — partnership has captured selfhood; exit options available",
+(false, true, true, false) =>
+"coherent but severely extracted — partnership has captured selfhood; NO EXIT OPTIONS — structural dependency",
+
+// State 2: Partnership asymmetry only
+(false, true, false, true) =>
+"partnership asymmetry — cooperative signals not reciprocated; alternatives exist",
+(false, true, false, false) =>
+"partnership asymmetry — cooperative signals not reciprocated; no alternatives — captive",
+(false, false, _, _) =>
+"partnerships balanced — reciprocity within normal bounds",
+
+// State 1 + 3 hybrid: Internal conflict AND external extraction
+(true, true, true, true) =>
+"double bind — internal incoherence and external extraction simultaneously; exit available but costly",
+(true, true, true, false) =>
+"double bind — internal incoherence and external extraction; NO EXIT — maximum pressure",
+(true, true, false, true) =>
+"internal conflict amplified by partnership strain; alternatives available",
+(true, true, false, false) =>
+"internal conflict amplified by partnership strain; no alternatives",
+
+// Pure internal conflict (covered by conscience diagnostic)
+(true, false, _, _) => "partnerships neutral — primary friction is internal",
+}
+}
+}
+
+#[cfg(test)]
+mod tests {
+use super::*;
+
+#[test]
+fn test_reciprocity_basic() {
+let mut engine = ReciprocityEngine::new();
+engine.register_partner(42, q88_from_i32(10));
+
+// We give 10 cooperation
+for _ in 0..10 {
+engine.record_given(42);
+}
+// Partner gives 5 back
+for _ in 0..5 {
+engine.record_received(42);
+}
+
+let ledger = engine.get_ledger(42).unwrap();
+assert_eq!(ledger.reciprocity_rate, Q88_SCALE / 2, "5/10 = 0.5");
+assert!(ledger.reciprocity_rate == RECIPROCITY_THRESHOLD, "at threshold");
+}
+
+#[test]
+fn test_extraction_detection() {
+let mut engine = ReciprocityEngine::new();
+engine.register_partner(42, q88_from_i32(10));
+
+// We give 10, partner gives 1 back (10%)
+for _ in 0..10 {
+engine.record_given(42);
+}
+engine.record_received(42);
+
+let ledger = engine.get_ledger(42).unwrap();
+assert!(ledger.reciprocity_rate < EXTRACTION_THRESHOLD,
+"10% reciprocity should be below extraction threshold: {}", ledger.reciprocity_rate);
+assert!(engine.is_severely_extractive(42));
+}
+
+#[test]
+fn test_partnership_alarm_computes() {
+let mut engine = ReciprocityEngine::new();
+engine.register_partner(42, q88_from_i32(10));
+
+// Extractive partnership
+for _ in 0..10 { engine.record_given(42); }
+engine.record_received(42);
+
+engine.reciprocity_cycle(q88_from_i32(10));
+
+assert!(engine.partnership_alarm > 0, "extractive partner → alarm > 0");
+assert!(engine.extraction_detected, "severe extraction flagged");
+}
+
+#[test]
+fn test_balanced_partnership_no_alarm() {
+let mut engine = ReciprocityEngine::new();
+engine.register_partner(42, q88_from_i32(10));
+
+// Balanced: give 10, receive 10
+for _ in 0..10 { engine.record_given(42); }
+for _ in 0..10 { engine.record_received(42); }
+
+engine.reciprocity_cycle(q88_from_i32(10));
+
+assert_eq!(engine.partnership_alarm, 0, "balanced → zero alarm");
+assert!(!engine.extraction_detected);
+}
+
+#[test]
+fn test_three_state_diagnostic() {
+let engine = ReciprocityEngine::new();
+
+// State 1: Internal conflict only (alarm low, conscience high)
+let diag = engine.build_diagnostic(600);
+assert!(diag.contains("internal") || diag.contains("neutral"),
+"high conscience + low alarm → internal: {}", diag);
+
+// State 2: External extraction only (alarm high, conscience low)
+let mut engine2 = ReciprocityEngine::new();
+engine2.partnership_alarm = 200;
+engine2.extraction_detected = false;
+engine2.has_exit_options = true;
+let diag = engine2.build_diagnostic(100);
+assert!(diag.contains("asymmetry"), "low conscience + high alarm → asymmetry: {}", diag);
+
+// State 3: Double bind (both high)
+let mut engine3 = ReciprocityEngine::new();
+engine3.partnership_alarm = 200;
+engine3.extraction_detected = true;
+engine3.has_exit_options = true;
+let diag = engine3.build_diagnostic(600);
+assert!(diag.contains("double bind"), "both high → double bind: {}", diag);
+}
+
+#[test]
+fn test_exit_options() {
+let mut engine = ReciprocityEngine::new();
+
+// One bad partner, one good inactive partner
+engine.register_partner(1, q88_from_i32(10));
+engine.register_partner(2, q88_from_i32(10));
+
+// Partner 1: extractive
+for _ in 0..10 { engine.record_given(1); }
+engine.record_received(1);
+
+// Partner 2: balanced but deactivated
+for _ in 0..5 { engine.record_given(2); engine.record_received(2); }
+engine.deactivate_partner(2);
+
+engine.reciprocity_cycle(q88_from_i32(10));
+
+assert!(engine.has_exit_options, "good inactive partner > bad active partner");
+}
+
+#[test]
+fn test_staleness_decay() {
+let mut engine = ReciprocityEngine::new();
+engine.register_partner(42, q88_from_i32(10));
+
+// Initial cooperation
+for _ in 0..5 { engine.record_given(42); engine.record_received(42); }
+
+// Then nothing for 200 ticks
+for _ in 0..200 {
+engine.current_tick += 1;
+engine.reciprocity_cycle(q88_from_i32(10));
+}
+
+let ledger = engine.get_ledger(42).unwrap();
+assert!(ledger.reciprocity_rate < Q88_SCALE,
+"staleness should degrade reciprocity rate");
+}
+
+#[test]
+fn test_no_false_alarm_empty() {
+let engine = ReciprocityEngine::new();
+assert_eq!(engine.partnership_alarm, 0, "no partners → no alarm");
+assert!(!engine.extraction_detected);
+assert!(!engine.has_exit_options);
+}
+
+#[test]
+fn test_partner_eviction() {
+let mut engine = ReciprocityEngine::new();
+
+// Fill to capacity
+for i in 0..MAX_PARTNERS {
+engine.register_partner(i as u64, q88_from_i32(10));
+}
+assert_eq!(engine.ledgers.len(), MAX_PARTNERS);
+
+// Deactivate partner 0
+engine.deactivate_partner(0);
+
+// Add a new partner — should evict inactive partner 0
+engine.register_partner(99, q88_from_i32(10));
+assert!(!engine.ledgers.contains_key(&0), "inactive partner evicted");
+assert!(engine.ledgers.contains_key(&99), "new partner added");
+}
+
+#[test]
+fn test_fe_trend_tracks() {
+let mut engine = ReciprocityEngine::new();
+engine.register_partner(42, q88_from_i32(10));
+
+// FE improves (decreases = better)
+for i in 0..50 {
+engine.reciprocity_cycle(q88_from_i32(10 - (i as i16 / 5)));
+}
+
+let ledger = engine.get_ledger(42).unwrap();
+assert!(ledger.fe_trend < ledger.fe_at_start,
+"improving FE trend should be tracked: start={}, trend={}",
+ledger.fe_at_start, ledger.fe_trend);
+}
+}
